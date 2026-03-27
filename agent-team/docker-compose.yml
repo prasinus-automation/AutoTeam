@@ -19,7 +19,7 @@ services:
   # ── The orchestrator ────────────────────────────────
   daemon:
     build: ./daemon
-    container_name: agent-daemon
+    container_name: ${COMPOSE_PROJECT_NAME:-agent-team}-daemon
     restart: unless-stopped
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -34,13 +34,14 @@ services:
       - MAX_BACKEND_AGENTS=${MAX_BACKEND_AGENTS:-2}
       - MAX_FIX_ITERATIONS=${MAX_FIX_ITERATIONS:-3}
       - LOG_DIR=/logs
-      - REPO_CACHE_VOLUME=agent-team_repo-cache
+      - REPO_CACHE_VOLUME=${COMPOSE_PROJECT_NAME:-agent-team}_repo-cache
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agent-team}
     ports:
       - "${WEBHOOK_PORT:-9876}:${WEBHOOK_PORT:-9876}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-logs:/logs
-      - /tmp/agent-tasks:/tmp/agent-tasks
+      - /tmp/${COMPOSE_PROJECT_NAME:-agent-team}-tasks:/tmp/agent-tasks
       - ${CLAUDE_CREDENTIALS_PATH:-/dev/null}:${CLAUDE_CREDENTIALS_PATH:-/dev/null}:ro
     networks:
       - agent-net
@@ -50,7 +51,7 @@ services:
   # Gives you a public https://xxx.trycloudflare.com URL.
   tunnel:
     image: cloudflare/cloudflared:latest
-    container_name: agent-tunnel
+    container_name: ${COMPOSE_PROJECT_NAME:-agent-team}-tunnel
     restart: unless-stopped
     command: tunnel --no-autoupdate --url http://daemon:${WEBHOOK_PORT:-9876}
     depends_on:
@@ -116,9 +117,9 @@ services:
 
 volumes:
   repo-cache:
-    name: agent-team_repo-cache
+    name: ${COMPOSE_PROJECT_NAME:-agent-team}_repo-cache
   agent-logs:
-    name: agent-team_agent-logs
+    name: ${COMPOSE_PROJECT_NAME:-agent-team}_agent-logs
 
 networks:
   agent-net:

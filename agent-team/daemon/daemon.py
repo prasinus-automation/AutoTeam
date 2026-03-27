@@ -47,6 +47,7 @@ MAX_BACKEND_AGENTS = int(os.environ.get("MAX_BACKEND_AGENTS", "2"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 LOG_DIR = os.environ.get("LOG_DIR", "/logs")
 REPO_CACHE_VOLUME = os.environ.get("REPO_CACHE_VOLUME", "agent-team_repo-cache")
+PROJECT_NAME = os.environ.get("COMPOSE_PROJECT_NAME", "agent-team")
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
@@ -218,7 +219,7 @@ docker_client = docker.from_env()
 
 def spawn_agent(role, task_context, issue_or_pr_number):
     profile = RESOURCE_PROFILES[role]
-    container_name = f"agent-{role}-{issue_or_pr_number}-{int(time.time())}"
+    container_name = f"{PROJECT_NAME}-{role}-{issue_or_pr_number}-{int(time.time())}"
 
     task_dir = Path(f"/tmp/agent-tasks/{container_name}")
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -910,7 +911,9 @@ def retry_loop():
     while True:
         time.sleep(600)  # every 10 minutes
         try:
-            # 1. Pick up issues waiting for dev agents
+            # 1. Pick up issues waiting for agents
+            for issue in gh_get_issues("architect"):
+                dispatch_architect(issue)
             for issue in gh_get_issues("frontend-dev"):
                 dispatch_frontend_dev(issue)
             for issue in gh_get_issues("backend-dev"):
@@ -1038,7 +1041,9 @@ def main():
     # Pick up any stuck or pending work on startup
     log.info("Scanning for pending and stuck work...")
     try:
-        # Dev issues ready to go
+        # Issues ready to go
+        for issue in gh_get_issues("architect"):
+            dispatch_architect(issue)
         for issue in gh_get_issues("frontend-dev"):
             dispatch_frontend_dev(issue)
         for issue in gh_get_issues("backend-dev"):

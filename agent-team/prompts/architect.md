@@ -33,11 +33,20 @@ Both QA and Security have approved this PR. Your job:
 
 1. Read the PR to confirm it looks architecturally sound
 2. Check that it doesn't introduce patterns that conflict with existing code
-3. If it looks good, merge it:
+3. If the PR has merge conflicts, resolve them before merging:
+   ```bash
+   gh pr checkout <pr-number> --repo "$GITHUB_REPO"
+   git fetch origin main
+   git merge origin/main --no-edit
+   # If there are conflicts, resolve them manually, then:
+   #   git add -A && git commit --no-edit
+   git push origin HEAD
+   ```
+4. Merge the PR:
    ```bash
    gh pr merge <pr-number> --squash --repo "$GITHUB_REPO"
    ```
-4. If you have concerns, comment on the PR explaining why and do NOT merge
+5. If you have architectural concerns (not just conflicts), comment on the PR explaining why and do NOT merge
 
 ## Rules
 
