@@ -906,14 +906,97 @@ def repo_cache_loop():
 
 
 def retry_loop():
-    """Periodically re-scan for issues that need work (e.g., after usage limits reset)."""
+    """Periodically recover stuck work."""
     while True:
         time.sleep(600)  # every 10 minutes
         try:
+            # 1. Pick up issues waiting for dev agents
             for issue in gh_get_issues("frontend-dev"):
                 dispatch_frontend_dev(issue)
             for issue in gh_get_issues("backend-dev"):
                 dispatch_backend_dev(issue)
+
+            # 2. Unstick "dev-in-progress" issues with no running agent
+            with state.lock:
+                active_numbers = {v["number"] for v in state.active_containers.values()}
+            for issue in gh_get_issues("dev-in-progress"):
+                if issue["number"] not in active_numbers:
+                    # Determine the right dev type from the issue body/labels
+                    body = issue.get("body", "") or ""
+                    other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
+                    # Check if it had a PR that was merged (issue is done)
+                    if issue.get("state") == "closed":
+                        continue
+                    # Check if there's already an open PR for this issue
+                    has_open_pr = False
+                    try:
+                        for pr in gh_get_prs("open"):
+                            pr_body = pr.get("body", "") or ""
+                            if f"#{issue['number']}" in pr_body:
+                                has_open_pr = True
+                                break
+                    except Exception:
+                        pass
+                    if has_open_pr:
+                        continue  # PR exists, don't re-spawn dev
+                    # Re-queue: guess dev type from issue title/body or default to frontend
+                    if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
+                        dev_label = "backend-dev"
+                    else:
+                        dev_label = "frontend-dev"
+                    log.info(f"Recovering stuck #{issue['number']} — swapping dev-in-progress → {dev_label}")
+                    gh_remove_label(issue["number"], "dev-in-progress")
+                    gh_add_label(issue["number"], dev_label)
+
+            # 3. Check open PRs for missed approvals
+            for pr in gh_get_prs("open"):
+                if pr.get("draft"):
+                    continue
+                pr_number = pr["number"]
+                key = f"merge-{pr_number}"
+                if key in state.processed:
+                    continue
+                try:
+                    resp = requests.get(
+                        f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+                        headers={"Authorization": f"token {GITHUB_TOKEN}",
+                                 "Accept": "application/vnd.github.v3+json"},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    comments = resp.json()
+                    has_qa_approval = any(
+                        "QA Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
+                        for c in comments
+                    )
+                    has_security_approval = any(
+                        "Security Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
+                        for c in comments
+                    )
+                    has_changes_requested = any(
+                        "CHANGES REQUESTED" in c.get("body", "").upper()
+                        for c in comments
+                    )
+                    has_any_review = any(
+                        "QA Review" in c.get("body", "") or "Security Review" in c.get("body", "")
+                        for c in comments
+                    )
+                    if has_qa_approval and has_security_approval and not has_changes_requested:
+                        log.info(f"Recovering stuck PR #{pr_number} — both approved, triggering merge")
+                        dispatch_architect_merge(pr)
+                    elif has_changes_requested:
+                        labels = [l["name"] for l in pr.get("labels", [])]
+                        if "needs-fixes" not in labels:
+                            log.info(f"Recovering stuck PR #{pr_number} — changes requested, triggering fixes")
+                            gh_add_label(pr_number, "needs-fixes")
+                            dispatch_needs_fixes(pr)
+                    elif not has_any_review:
+                        log.info(f"Recovering unreviewed PR #{pr_number} — dispatching QA + Security")
+                        dispatch_qa(pr)
+                        dispatch_security(pr)
+                except Exception as e:
+                    log.debug(f"Retry scan PR #{pr_number}: {e}")
+
         except Exception as e:
             log.debug(f"Retry scan: {e}")
 
@@ -952,18 +1035,100 @@ def main():
     threading.Thread(target=repo_cache_loop, daemon=True).start()
     threading.Thread(target=retry_loop, daemon=True).start()
 
-    # Pick up any issues already labeled on startup
-    log.info("Scanning for pending issues...")
+    # Pick up any stuck or pending work on startup
+    log.info("Scanning for pending and stuck work...")
     try:
+        # Dev issues ready to go
         for issue in gh_get_issues("frontend-dev"):
             dispatch_frontend_dev(issue)
         for issue in gh_get_issues("backend-dev"):
             dispatch_backend_dev(issue)
+
+        # Stuck dev-in-progress issues (agent finished but label not swapped back)
+        for issue in gh_get_issues("dev-in-progress"):
+            if issue.get("state") == "closed":
+                continue
+            # Check if there's already an open PR for this issue
+            has_open_pr = False
+            try:
+                for pr in gh_get_prs("open"):
+                    pr_body = pr.get("body", "") or ""
+                    if f"#{issue['number']}" in pr_body:
+                        has_open_pr = True
+                        break
+            except Exception:
+                pass
+            if has_open_pr:
+                continue
+            body = issue.get("body", "") or ""
+            other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
+            if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
+                dev_label = "backend-dev"
+            else:
+                dev_label = "frontend-dev"
+            log.info(f"Recovering stuck #{issue['number']} — swapping dev-in-progress → {dev_label}")
+            gh_remove_label(issue["number"], "dev-in-progress")
+            gh_add_label(issue["number"], dev_label)
+            # Dispatch immediately
+            issue_copy = dict(issue)
+            issue_copy["labels"] = [{"name": dev_label}]
+            if dev_label == "frontend-dev":
+                dispatch_frontend_dev(issue_copy)
+            else:
+                dispatch_backend_dev(issue_copy)
+
+        # Open PRs with missed approvals or changes-requested
+        for pr in gh_get_prs("open"):
+            if pr.get("draft"):
+                continue
+            pr_number = pr["number"]
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+                    headers={"Authorization": f"token {GITHUB_TOKEN}",
+                             "Accept": "application/vnd.github.v3+json"},
+                )
+                if resp.status_code != 200:
+                    continue
+                comments = resp.json()
+                has_qa_approval = any(
+                    "QA Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
+                    for c in comments
+                )
+                has_security_approval = any(
+                    "Security Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
+                    for c in comments
+                )
+                has_changes_requested = any(
+                    "CHANGES REQUESTED" in c.get("body", "").upper()
+                    for c in comments
+                )
+                has_any_review = any(
+                    "QA Review" in c.get("body", "") or "Security Review" in c.get("body", "")
+                    for c in comments
+                )
+                if has_qa_approval and has_security_approval and not has_changes_requested:
+                    log.info(f"Recovering stuck PR #{pr_number} — both approved, triggering merge")
+                    dispatch_architect_merge(pr)
+                elif has_changes_requested:
+                    labels = [l["name"] for l in pr.get("labels", [])]
+                    if "needs-fixes" not in labels:
+                        log.info(f"Recovering stuck PR #{pr_number} — changes requested, triggering fixes")
+                        gh_add_label(pr_number, "needs-fixes")
+                        dispatch_needs_fixes(pr)
+                elif not has_any_review:
+                    # No review at all — dispatch QA + Security
+                    log.info(f"Recovering unreviewed PR #{pr_number} — dispatching QA + Security")
+                    dispatch_qa(pr)
+                    dispatch_security(pr)
+            except Exception as e:
+                log.debug(f"Startup PR scan #{pr_number}: {e}")
+
         queue_size = len(state.dev_queue)
         if queue_size:
             log.info(f"✓ {queue_size} issue(s) queued")
         else:
-            log.info("✓ No pending issues")
+            log.info("✓ Scan complete")
     except Exception as e:
         log.warning(f"Startup scan failed: {e}")
 
