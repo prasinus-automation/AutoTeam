@@ -80,9 +80,17 @@ If your task JSON has `action: "fix_review_feedback"`, a previous version of thi
 5. Comment on the PR summarizing what you fixed
 
 ```bash
+git fetch origin
 git checkout <pr_branch>
 git pull origin <pr_branch>
-# ... fix issues ...
+# Merge main to resolve any conflicts before fixing
+git merge origin/main --no-edit || {
+  # If there are conflicts, resolve them
+  # Look at conflicting files, pick the right version, then:
+  git add -A
+  git commit --no-edit
+}
+# ... fix review issues ...
 git add -A
 git commit -m "fix: address review feedback (#<issue-number>)"
 git push origin HEAD

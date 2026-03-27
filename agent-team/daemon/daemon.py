@@ -777,8 +777,23 @@ def handle_webhook_event(event, payload):
         if issue.get("pull_request"):
             pr_number = issue["number"]
             pr_url = issue["pull_request"].get("url", "")
-            if pr_url and ("APPROVED" in comment_body.upper() or "✅" in comment_body):
-                _check_both_approved(pr_number, pr_url, comment_body)
+            if "CHANGES REQUESTED" in comment_body.upper() or "❌" in comment_body:
+                # QA or Security requested changes — add label and trigger fix flow
+                log.info(f"Changes requested on PR #{pr_number} via comment")
+                gh_add_label(pr_number, "needs-fixes")
+                try:
+                    pr_resp = requests.get(
+                        pr_url,
+                        headers={"Authorization": f"token {GITHUB_TOKEN}",
+                                 "Accept": "application/vnd.github.v3+json"},
+                    )
+                    if pr_resp.status_code == 200:
+                        dispatch_needs_fixes(pr_resp.json())
+                except Exception as e:
+                    log.error(f"Error triggering fixes for PR #{pr_number}: {e}")
+            elif "APPROVED" in comment_body.upper() or "✅" in comment_body:
+                if pr_url:
+                    _check_both_approved(pr_number, pr_url, comment_body)
 
     # ── PR review submitted (fallback) ────────────────
     elif event == "pull_request_review" and action == "submitted":
