@@ -1,0 +1,13 @@
+FROM agent-base:latest
+
+LABEL agent.role="architect"
+LABEL agent.description="Reads codebase, plans features, creates GitHub issues, merges approved PRs"
+
+# Architect doesn't need heavy build tools — mostly reads code and writes issues
+# Add any doc/diagram tools if desired
+RUN pip install --break-system-packages \
+    pyyaml
+
+COPY prompts/architect.md /prompts/system.md
+
+ENV AGENT_ROLE=architect

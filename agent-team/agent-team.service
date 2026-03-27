@@ -1,0 +1,36 @@
+[Unit]
+Description=Agent Team — AI Dev Pipeline
+Documentation=https://github.com/your/agent-team
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+Group=docker
+WorkingDirectory=%WORK_DIR%
+
+# Start
+ExecStart=/usr/bin/docker compose up
+
+# Stop gracefully — tear down containers
+ExecStop=/usr/bin/docker compose down
+
+# If the daemon crashes, wait 10s and restart
+Restart=on-failure
+RestartSec=10
+
+# Kill any orphaned agent containers on stop
+ExecStopPost=/bin/bash -c 'docker rm -f $(docker ps -a --filter "name=agent-" -q) 2>/dev/null || true'
+
+# Environment file
+EnvironmentFile=%WORK_DIR%/.env
+
+# Logging goes to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-team
+
+[Install]
+WantedBy=multi-user.target

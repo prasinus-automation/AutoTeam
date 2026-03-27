@@ -1,0 +1,125 @@
+version: "3.8"
+
+# ═══════════════════════════════════════════════════════════
+#  Agent Team — Docker Compose
+#
+#  Services:
+#    daemon     - Watches GitHub (webhook or polling), spawns agents
+#    tunnel     - Cloudflare tunnel to expose webhook endpoint
+#    agent-*    - Built here, spawned by daemon at runtime
+#
+#  Usage:
+#    1. cp .env.example .env   (fill in your keys)
+#    2. make build              (build all images)
+#    3. make init-repo          (clone target repo into cache)
+#    4. docker compose up -d    (start daemon + tunnel)
+# ═══════════════════════════════════════════════════════════
+
+services:
+  # ── The orchestrator ────────────────────────────────
+  daemon:
+    build: ./daemon
+    container_name: agent-daemon
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CREDENTIALS_PATH=${CLAUDE_CREDENTIALS_PATH:-}
+      - MODE=${MODE:-webhook}
+      - WEBHOOK_PORT=${WEBHOOK_PORT:-9876}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      - POLL_INTERVAL=${POLL_INTERVAL:-30}
+      - MAX_FRONTEND_AGENTS=${MAX_FRONTEND_AGENTS:-2}
+      - MAX_BACKEND_AGENTS=${MAX_BACKEND_AGENTS:-2}
+      - MAX_FIX_ITERATIONS=${MAX_FIX_ITERATIONS:-3}
+      - LOG_DIR=/logs
+      - REPO_CACHE_VOLUME=agent-team_repo-cache
+    ports:
+      - "${WEBHOOK_PORT:-9876}:${WEBHOOK_PORT:-9876}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-logs:/logs
+      - /tmp/agent-tasks:/tmp/agent-tasks
+      - ${CLAUDE_CREDENTIALS_PATH:-/dev/null}:${CLAUDE_CREDENTIALS_PATH:-/dev/null}:ro
+    networks:
+      - agent-net
+
+  # ── Cloudflare tunnel (exposes webhook to GitHub) ───
+  # Free, no account needed for quick tunnels.
+  # Gives you a public https://xxx.trycloudflare.com URL.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: agent-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://daemon:${WEBHOOK_PORT:-9876}
+    depends_on:
+      - daemon
+    networks:
+      - agent-net
+    # The tunnel URL will be printed in the logs:
+    #   docker compose logs tunnel
+    # Copy that URL into your GitHub webhook settings.
+
+  # ── Agent images (build-only, spawned by daemon) ────
+  agent-base:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.base
+    image: agent-base:latest
+    profiles: ["build-only"]
+
+  agent-architect:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.architect
+    image: agent-architect:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+  agent-frontend-dev:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.frontend-dev
+    image: agent-frontend-dev:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+  agent-backend-dev:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.backend-dev
+    image: agent-backend-dev:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+  agent-qa:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.qa
+    image: agent-qa:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+  agent-security:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.security
+    image: agent-security:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+volumes:
+  repo-cache:
+    name: agent-team_repo-cache
+  agent-logs:
+    name: agent-team_agent-logs
+
+networks:
+  agent-net:
+    driver: bridge

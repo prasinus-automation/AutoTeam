@@ -1,0 +1,17 @@
+FROM agent-base:latest
+
+LABEL agent.role="frontend-dev"
+LABEL agent.description="Picks up frontend-dev issues, writes frontend code, runs tests, opens PRs"
+
+# Node.js already included from base image
+# Frontend test and build tools
+RUN npm install -g \
+    jest \
+    vitest \
+    eslint \
+    prettier \
+    typescript
+
+COPY prompts/frontend-dev.md /prompts/system.md
+
+ENV AGENT_ROLE=frontend-dev

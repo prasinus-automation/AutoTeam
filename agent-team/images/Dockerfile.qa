@@ -1,0 +1,21 @@
+FROM agent-base:latest
+
+LABEL agent.role="qa"
+LABEL agent.description="Reviews PRs, runs test suites, approves or files bugs"
+
+# Test & coverage tools
+RUN pip install --break-system-packages \
+    pytest \
+    pytest-cov \
+    coverage \
+    ruff \
+    bandit
+
+# Node test tools (if your projects use them)
+RUN npm install -g \
+    jest \
+    vitest
+
+COPY prompts/qa.md /prompts/system.md
+
+ENV AGENT_ROLE=qa

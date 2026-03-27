@@ -1,0 +1,27 @@
+FROM agent-base:latest
+
+LABEL agent.role="backend-dev"
+LABEL agent.description="Picks up backend-dev issues, writes backend code, runs tests, opens PRs"
+
+# Python dev tools
+RUN pip install --break-system-packages \
+    pytest \
+    black \
+    ruff \
+    mypy
+
+# Uncomment what you need for your projects:
+# --- Rust ---
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# ENV PATH="/root/.cargo/bin:${PATH}"
+
+# --- Go ---
+# RUN curl -fsSL https://go.dev/dl/go1.22.0.linux-amd64.tar.gz | tar -C /usr/local -xzf -
+# ENV PATH="/usr/local/go/bin:${PATH}"
+
+# --- Docker CLI (for projects that build containers) ---
+# RUN curl -fsSL https://get.docker.com | sh
+
+COPY prompts/backend-dev.md /prompts/system.md
+
+ENV AGENT_ROLE=backend-dev

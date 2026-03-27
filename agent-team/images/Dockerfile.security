@@ -1,0 +1,22 @@
+FROM agent-base:latest
+
+LABEL agent.role="security"
+LABEL agent.description="Reviews PRs for security vulnerabilities, runs SAST scans"
+
+# Python security tools
+RUN pip install --break-system-packages \
+    bandit \
+    pip-audit
+
+# Install semgrep via official installer (PyPI package requires pre-built semgrep-core)
+RUN python3 -m pip install --break-system-packages pipx && \
+    pipx install semgrep && \
+    ln -s /root/.local/bin/semgrep /usr/local/bin/semgrep
+
+# Node security tools
+RUN npm install -g \
+    npm-audit-resolver
+
+COPY prompts/security.md /prompts/system.md
+
+ENV AGENT_ROLE=security
