@@ -65,19 +65,43 @@ elif [ -n "${TASK_FILE}" ]; then
     TASK_CONTENT="${TASK_FILE}"
 fi
 
+# ─── Load project context ────────────────────────────────
+# AGENTS.md in the repo root provides project-specific context
+# (tech stack, versions, conventions) that all agents need.
+PROJECT_CONTEXT=""
+if [ -f "${WORK_DIR}/AGENTS.md" ]; then
+    PROJECT_CONTEXT=$(cat "${WORK_DIR}/AGENTS.md")
+    echo "✓ Project context loaded (AGENTS.md)"
+fi
+
+# ─── Build system prompt ─────────────────────────────────
+# Combine the role-specific prompt with project context
+FULL_SYSTEM_PROMPT="$(cat ${SYSTEM_PROMPT})"
+if [ -n "${PROJECT_CONTEXT}" ]; then
+    FULL_SYSTEM_PROMPT="${FULL_SYSTEM_PROMPT}
+
+---
+
+# Project Context (from AGENTS.md)
+
+The following is project-specific context maintained by the Architect. Follow these conventions strictly — they override any assumptions from your training data.
+
+${PROJECT_CONTEXT}"
+fi
+
 # ─── Run Claude Code ─────────────────────────────────────
 echo ""
 echo "─── Starting Claude Code ────────────────"
 echo ""
 
 # Claude Code runs with:
-#   - The role-specific system prompt
+#   - The role-specific system prompt (+ project context from AGENTS.md)
 #   - The task context
 #   - Access to the working directory (repo)
 #   - GitHub token for API operations
 
 echo "${TASK_CONTENT}" | claude --print \
-    --system-prompt "$(cat ${SYSTEM_PROMPT})" \
+    --system-prompt "${FULL_SYSTEM_PROMPT}" \
     --allowedTools "Bash,Read,Write,Edit,GitHub"
 
 EXIT_CODE=$?

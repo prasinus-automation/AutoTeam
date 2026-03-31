@@ -19,6 +19,7 @@ Events:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -26,7 +27,7 @@ import hmac
 import hashlib
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -45,9 +46,12 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 MAX_FRONTEND_AGENTS = int(os.environ.get("MAX_FRONTEND_AGENTS", "2"))
 MAX_BACKEND_AGENTS = int(os.environ.get("MAX_BACKEND_AGENTS", "2"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
+MAX_TRANSIENT_RETRIES = int(os.environ.get("MAX_TRANSIENT_RETRIES", "5"))
+TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # seconds
 LOG_DIR = os.environ.get("LOG_DIR", "/logs")
 REPO_CACHE_VOLUME = os.environ.get("REPO_CACHE_VOLUME", "agent-team_repo-cache")
 PROJECT_NAME = os.environ.get("COMPOSE_PROJECT_NAME", "agent-team")
+MAX_TOTAL_AGENTS = int(os.environ.get("MAX_TOTAL_AGENTS", "3"))
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
@@ -125,6 +129,24 @@ def gh_comment(issue_number, body):
     )
 
 
+def gh_issue_has_open_pr(issue_number):
+    """Check if an issue already has an open PR (by body reference or branch name)."""
+    try:
+        for pr in gh_get_prs("open"):
+            pr_body = pr.get("body", "") or ""
+            branch = pr.get("head", {}).get("ref", "")
+            # Check PR body for "Closes #N", "#N", etc.
+            if f"#{issue_number}" in pr_body:
+                return True
+            # Check branch name for the issue number (e.g., frontend/5-slug)
+            import re
+            if re.search(rf'(?:^|/)(?:{issue_number})\b', branch):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def gh_get_pr_reviews(pr_number):
     """Get all reviews on a PR."""
     return gh_get(f"/repos/{GITHUB_REPO}/pulls/{pr_number}/reviews")
@@ -197,6 +219,8 @@ class DaemonState:
         self.frontend_dev_count = 0
         self.backend_dev_count = 0
         self.fix_iterations = {}  # pr_number -> iteration count
+        self.retry_counts = {}  # "role-number" -> transient retry count
+        self.retry_backoff_until = {}  # "role-number" -> datetime to wait until
         self.dev_queue = []  # list of (role, issue) waiting for a slot
         self.lock = threading.Lock()
 
@@ -218,13 +242,35 @@ docker_client = docker.from_env()
 # ─── Container Management ────────────────────────────────
 
 def spawn_agent(role, task_context, issue_or_pr_number):
+    with state.lock:
+        # Prevent duplicate agents for the same role + issue/PR
+        for info in state.active_containers.values():
+            if info["role"] == role and info["number"] == issue_or_pr_number:
+                log.debug(f"Skipping {role} for #{issue_or_pr_number} — already running")
+                return None
+        # Respect transient error backoff
+        retry_key = f"{role}-{issue_or_pr_number}"
+        backoff_until = state.retry_backoff_until.get(retry_key)
+        if backoff_until and datetime.now(timezone.utc) < backoff_until:
+            remaining = int((backoff_until - datetime.now(timezone.utc)).total_seconds())
+            log.debug(f"Skipping {role} for #{issue_or_pr_number} — backoff ({remaining}s remaining)")
+            return None
+        # Global concurrency limit (QA/Security are lightweight, exempt them)
+        if role not in ("qa", "security") and len(state.active_containers) >= MAX_TOTAL_AGENTS:
+            log.info(f"Max agents ({MAX_TOTAL_AGENTS}) reached — deferring {role} for #{issue_or_pr_number}")
+            return None
+
     profile = RESOURCE_PROFILES[role]
     container_name = f"{PROJECT_NAME}-{role}-{issue_or_pr_number}-{int(time.time())}"
 
+    # Write task file inside daemon container
     task_dir = Path(f"/tmp/agent-tasks/{container_name}")
     task_dir.mkdir(parents=True, exist_ok=True)
     task_file = task_dir / "task.json"
     task_file.write_text(json.dumps(task_context, indent=2))
+
+    # Host path for volume mount (daemon's /tmp/agent-tasks maps to host /tmp/{PROJECT_NAME}-tasks)
+    host_task_dir = f"/tmp/{PROJECT_NAME}-tasks/{container_name}"
 
     log.info(f"Spawning {role} for #{issue_or_pr_number}")
 
@@ -239,7 +285,7 @@ def spawn_agent(role, task_context, issue_or_pr_number):
 
         volumes = {
             REPO_CACHE_VOLUME: {"bind": "/repo", "mode": "ro"},
-            str(task_dir): {"bind": "/tmp/task", "mode": "ro"},
+            host_task_dir: {"bind": "/tmp/task", "mode": "ro"},
         }
         # Mount Claude subscription credentials if provided (instead of API key)
         if CLAUDE_CREDENTIALS_PATH and os.path.exists(CLAUDE_CREDENTIALS_PATH):
@@ -247,18 +293,34 @@ def spawn_agent(role, task_context, issue_or_pr_number):
                 "bind": "/root/.claude/.credentials.json", "mode": "ro",
             }
 
-        container = docker_client.containers.run(
-            image=f"agent-{role}:latest",
-            name=container_name,
-            command=["/tmp/task/task.json"],
-            environment=env,
-            volumes=volumes,
-            mem_limit=profile["mem_limit"],
-            nano_cpus=int(profile["cpus"] * 1e9),
-            detach=True,
-            auto_remove=False,
-            network_mode="host",
-        )
+        # Increment dev count before spawning to prevent race conditions
+        with state.lock:
+            if role == "frontend-dev":
+                state.frontend_dev_count += 1
+            elif role == "backend-dev":
+                state.backend_dev_count += 1
+
+        try:
+            container = docker_client.containers.run(
+                image=f"agent-{role}:latest",
+                name=container_name,
+                command=["/tmp/task/task.json"],
+                environment=env,
+                volumes=volumes,
+                mem_limit=profile["mem_limit"],
+                nano_cpus=int(profile["cpus"] * 1e9),
+                detach=True,
+                auto_remove=False,
+                network_mode="host",
+            )
+        except Exception:
+            # Roll back count if container failed to start
+            with state.lock:
+                if role == "frontend-dev":
+                    state.frontend_dev_count -= 1
+                elif role == "backend-dev":
+                    state.backend_dev_count -= 1
+            raise
 
         with state.lock:
             state.active_containers[container.id] = {
@@ -266,10 +328,6 @@ def spawn_agent(role, task_context, issue_or_pr_number):
                 "container": container, "name": container_name,
                 "started": datetime.now(timezone.utc),
             }
-            if role == "frontend-dev":
-                state.frontend_dev_count += 1
-            elif role == "backend-dev":
-                state.backend_dev_count += 1
 
         log.info(f"✓ {container_name} started ({container.short_id})")
         threading.Thread(target=monitor_container, args=(container.id,), daemon=True).start()
@@ -299,33 +357,60 @@ def monitor_container(container_id):
 
         if exit_code == 0:
             log.info(f"✓ {info['name']} completed")
+            # Clear retry state on success
+            retry_key = f"{info['role']}-{info['number']}"
+            with state.lock:
+                state.retry_counts.pop(retry_key, None)
+                state.retry_backoff_until.pop(retry_key, None)
+            # Agents post their own review comments directly — no need for
+            # daemon-verified duplicates (they spam the PR and break pagination).
         else:
             log.warning(f"✗ {info['name']} exited ({exit_code})")
 
-            # Check if it looks like a rate limit / usage limit
-            is_limit = False
+            # Check if it's a transient error (rate limit, auth expiry)
+            is_transient = False
             try:
                 logs_text = container.logs(tail=50).decode("utf-8", errors="replace")
-                is_limit = any(s in logs_text.lower() for s in [
+                is_transient = any(s in logs_text.lower() for s in [
                     "rate limit", "usage limit", "too many requests",
                     "429", "overloaded", "capacity",
+                    "authentication_error", "401", "invalid authentication",
                 ])
             except Exception:
                 pass
 
-            if is_limit and info["role"] in ("frontend-dev", "backend-dev"):
-                # Swap label back so it gets retried later
-                gh_remove_label(info["number"], "dev-in-progress")
-                gh_add_label(info["number"], info["role"])
-                state.clear_handled(f"{info['role']}-{info['number']}")
-                gh_comment(info["number"],
-                           f"⏳ Agent `{info['role']}` hit a usage limit. Will retry automatically when limits reset.")
-                log.info(f"↻ {info['name']} hit usage limit — re-queued #{info['number']}")
-            elif is_limit and info["role"] in ("qa", "security"):
-                state.clear_handled(f"{info['role']}-{info['number']}")
-                gh_comment(info["number"],
-                           f"⏳ Agent `{info['role']}` hit a usage limit. Will retry automatically when limits reset.")
-                log.info(f"↻ {info['name']} hit usage limit — will retry #{info['number']}")
+            if is_transient:
+                retry_key = f"{info['role']}-{info['number']}"
+                with state.lock:
+                    retries = state.retry_counts.get(retry_key, 0) + 1
+                    state.retry_counts[retry_key] = retries
+
+                if retries > MAX_TRANSIENT_RETRIES:
+                    log.warning(f"✗ {info['name']} exceeded max transient retries ({MAX_TRANSIENT_RETRIES})")
+                    gh_comment(info["number"],
+                               f"⚠️ Agent `{info['role']}` failed after {MAX_TRANSIENT_RETRIES} retries "
+                               f"(rate limit / transient error). Requires manual intervention.")
+                else:
+                    # Exponential backoff: 60s, 120s, 240s, 480s, 960s
+                    backoff = TRANSIENT_BACKOFF_BASE * (2 ** (retries - 1))
+                    backoff_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                    with state.lock:
+                        state.retry_backoff_until[retry_key] = backoff_until
+
+                    state.clear_handled(f"{info['role']}-{info['number']}")
+                    if info["role"] in ("frontend-dev", "backend-dev"):
+                        gh_remove_label(info["number"], "dev-in-progress")
+                        gh_add_label(info["number"], info["role"])
+                    elif info["role"] == "architect":
+                        gh_remove_label(info["number"], "architect-in-progress")
+                        gh_add_label(info["number"], "architect")
+
+                    if retries == 1:
+                        gh_comment(info["number"],
+                                   f"⏳ Agent `{info['role']}` hit a transient error. "
+                                   f"Will retry in {backoff}s (attempt {retries}/{MAX_TRANSIENT_RETRIES}).")
+                    log.info(f"↻ {info['name']} transient error — retry {retries}/{MAX_TRANSIENT_RETRIES} "
+                             f"in {backoff}s")
             else:
                 gh_comment(info["number"],
                            f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
@@ -369,16 +454,19 @@ def dispatch_architect(issue):
         return
 
     log.info(f"Architect issue: #{number} — {issue['title']}")
-    gh_remove_label(number, "architect")
-    gh_add_label(number, "architect-in-progress")
 
-    spawn_agent("architect", {
+    result = spawn_agent("architect", {
         "action": "plan_feature",
         "issue_number": number,
         "issue_title": issue["title"],
         "issue_body": issue.get("body", ""),
         "issue_url": issue.get("html_url", ""),
     }, number)
+    if result is None:
+        state.clear_handled(key)
+        return
+    gh_remove_label(number, "architect")
+    gh_add_label(number, "architect-in-progress")
 
 
 def dispatch_frontend_dev(issue):
@@ -522,15 +610,13 @@ def dispatch_dependents(pr):
 
 def dispatch_qa(pr):
     number = pr["number"]
-    key = f"qa-{number}-{pr.get('head', {}).get('sha', '')[:8]}"
+    key = f"qa-{number}"
     if state.already_handled(key):
         return
     branch = pr.get("head", {}).get("ref", "")
     if branch.startswith("docs/"):
         return
-
-    log.info(f"QA review: PR #{number} — {pr['title']}")
-    spawn_agent("qa", {
+    result = spawn_agent("qa", {
         "action": "review_pr",
         "pr_number": number,
         "pr_title": pr["title"],
@@ -538,19 +624,21 @@ def dispatch_qa(pr):
         "pr_url": pr.get("html_url", ""),
         "pr_branch": branch,
     }, number)
+    if result:
+        log.info(f"QA review: PR #{number} — {pr['title']}")
+    else:
+        state.clear_handled(key)
 
 
 def dispatch_security(pr):
     number = pr["number"]
-    key = f"security-{number}-{pr.get('head', {}).get('sha', '')[:8]}"
+    key = f"security-{number}"
     if state.already_handled(key):
         return
     branch = pr.get("head", {}).get("ref", "")
     if branch.startswith("docs/"):
         return
-
-    log.info(f"Security review: PR #{number} — {pr['title']}")
-    spawn_agent("security", {
+    result = spawn_agent("security", {
         "action": "review_pr",
         "pr_number": number,
         "pr_title": pr["title"],
@@ -558,6 +646,10 @@ def dispatch_security(pr):
         "pr_url": pr.get("html_url", ""),
         "pr_branch": branch,
     }, number)
+    if result:
+        log.info(f"Security review: PR #{number} — {pr['title']}")
+    else:
+        state.clear_handled(key)
 
 
 def dispatch_needs_fixes(pr):
@@ -574,12 +666,28 @@ def dispatch_needs_fixes(pr):
         log.warning(f"PR #{number} branch '{branch}' has no frontend/ or backend/ prefix — skipping")
         return
 
-    # Check iteration limit
-    with state.lock:
-        iterations = state.fix_iterations.get(number, 0) + 1
+    # Check iteration limit — count existing fix commits in PR comments to survive restarts
+    try:
+        comments = requests.get(
+            f"{API}/repos/{GITHUB_REPO}/issues/{number}/comments",
+            headers=HEADERS,
+        ).json()
+        fix_count = sum(1 for c in comments if isinstance(c, dict) and "address review feedback" in c.get("body", "").lower())
+        # Also count "needs fixes" dispatch logs
+        with state.lock:
+            mem_iterations = state.fix_iterations.get(number, 0)
+        iterations = max(fix_count, mem_iterations) + 1
         state.fix_iterations[number] = iterations
+    except Exception:
+        with state.lock:
+            iterations = state.fix_iterations.get(number, 0) + 1
+            state.fix_iterations[number] = iterations
 
     if iterations > MAX_FIX_ITERATIONS:
+        # Only log once per restart, and mark as handled so we stop retrying
+        key = f"max-fix-{number}"
+        if state.already_handled(key):
+            return
         log.warning(f"PR #{number} hit max fix iterations ({MAX_FIX_ITERATIONS})")
         gh_comment(number,
                    f"⚠️ This PR has gone through {MAX_FIX_ITERATIONS} review/fix cycles. "
@@ -758,6 +866,9 @@ def handle_webhook_event(event, payload):
     elif event == "pull_request" and action in ("opened", "reopened", "synchronize"):
         pr = payload.get("pull_request", {})
         if not pr.get("draft"):
+            # Clear previous review state so QA/Security re-run on new code
+            state.clear_handled(f"qa-{pr['number']}")
+            state.clear_handled(f"security-{pr['number']}")
             dispatch_qa(pr)
             dispatch_security(pr)
 
@@ -776,6 +887,9 @@ def handle_webhook_event(event, payload):
         issue = payload.get("issue", {})
         # Only care about PR comments (issues with pull_request key)
         if issue.get("pull_request"):
+            # Skip daemon-posted comments to avoid self-triggering loops
+            if "Daemon-verified:" in comment_body or "Agent `" in comment_body:
+                return
             pr_number = issue["number"]
             pr_url = issue["pull_request"].get("url", "")
             if "CHANGES REQUESTED" in comment_body.upper() or "❌" in comment_body:
@@ -827,37 +941,126 @@ def run_webhook_server():
 # ═══════════════════════════════════════════════════════════
 
 def poll_github():
-    # Architect issues
-    for issue in gh_get_issues("architect"):
-        dispatch_architect(issue)
+    """Poll GitHub for work. Uses GitHub state as source of truth.
+    spawn_agent's duplicate check prevents double-spawning."""
 
-    # Frontend dev issues
+    # Issues ready to go
+    for issue in gh_get_issues("architect"):
+        number = issue["number"]
+        # spawn_agent checks for duplicates, so just try to spawn
+        result = spawn_agent("architect", {
+            "action": "plan_feature",
+            "issue_number": number,
+            "issue_title": issue["title"],
+            "issue_body": issue.get("body", ""),
+            "issue_url": issue.get("html_url", ""),
+        }, number)
+        if result:
+            log.info(f"Architect issue: #{number} — {issue['title']}")
+            gh_remove_label(number, "architect")
+            gh_add_label(number, "architect-in-progress")
+
     for issue in gh_get_issues("frontend-dev"):
         dispatch_frontend_dev(issue)
-
-    # Backend dev issues
     for issue in gh_get_issues("backend-dev"):
         dispatch_backend_dev(issue)
 
-    # Open PRs — QA reviews first (Security runs after QA approves via review event)
-    for pr in gh_get_prs("open"):
-        if not pr.get("draft"):
-            dispatch_qa(pr)
+    # Stuck dev-in-progress issues (no agent running, no open PR)
+    with state.lock:
+        active_numbers = {v["number"] for v in state.active_containers.values()}
+    for issue in gh_get_issues("dev-in-progress"):
+        if issue.get("state") == "closed" or issue["number"] in active_numbers:
+            continue
+        if gh_issue_has_open_pr(issue["number"]):
+            continue
+        body = issue.get("body", "") or ""
+        other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
+        if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
+            dev_label = "backend-dev"
+        else:
+            dev_label = "frontend-dev"
+        log.info(f"Recovering stuck #{issue['number']} → {dev_label}")
+        gh_remove_label(issue["number"], "dev-in-progress")
+        gh_add_label(issue["number"], dev_label)
 
-    # PRs labeled needs-fixes
+    # Open PRs — check review state and take action
     for pr in gh_get_prs("open"):
-        labels = [l.get("name") for l in pr.get("labels", [])]
-        if "needs-fixes" in labels:
-            dispatch_needs_fixes(pr)
+        if pr.get("draft"):
+            continue
+        pr_number = pr["number"]
+        try:
+            # Fetch the LAST page of comments (most recent) to find latest review state.
+            # GitHub Issues Comments API always returns chronologically; use Link header
+            # to jump to the last page so we see recent reviews on heavily-commented PRs.
+            resp = requests.get(
+                f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+                headers=HEADERS,
+                params={"per_page": 100},
+            )
+            if resp.status_code != 200:
+                continue
+            link_header = resp.headers.get("Link", "")
+            if 'rel="last"' in link_header:
+                last_match = re.search(r'<([^>]+)>;\s*rel="last"', link_header)
+                if last_match:
+                    last_resp = requests.get(last_match.group(1), headers=HEADERS)
+                    if last_resp.status_code == 200:
+                        comments = last_resp.json()
+                    else:
+                        comments = resp.json()
+                else:
+                    comments = resp.json()
+            else:
+                comments = resp.json()
 
-    # Check for PRs where QA approved but Security hasn't run yet
-    for pr in gh_get_prs("open"):
-        if not pr.get("draft"):
-            reviews = gh_get_pr_reviews(pr["number"])
-            qa_done = any("QA Review:" in r.get("body", "") and r.get("state") == "APPROVED" for r in reviews)
-            sec_done = any("Security Review:" in r.get("body", "") for r in reviews)
-            if qa_done and not sec_done:
-                dispatch_security(pr)
+            # Parse the LATEST state from comments (not just any comment)
+            # Look at comments in reverse to find the most recent review
+            last_qa_approved = False
+            last_sec_approved = False
+            last_changes_requested = False
+            has_qa = False
+            has_sec = False
+            for c in reversed(comments):
+                body = c.get("body", "")
+                # Skip daemon-generated comments — only trust agent-posted reviews
+                if "Daemon-verified:" in body or "Agent `" in body:
+                    continue
+                if "QA Review" in body and not has_qa:
+                    has_qa = True
+                    last_qa_approved = "APPROVED" in body.upper() or "✅" in body
+                    if "CHANGES REQUESTED" in body.upper():
+                        last_changes_requested = True
+                if "Security Review" in body and not has_sec:
+                    has_sec = True
+                    last_sec_approved = "APPROVED" in body.upper() or "✅" in body
+                    if "CHANGES REQUESTED" in body.upper():
+                        last_changes_requested = True
+
+            if last_qa_approved and last_sec_approved and not last_changes_requested:
+                # Both approved — merge
+                result = spawn_agent("architect", {
+                    "action": "merge_approved_pr",
+                    "pr_number": pr_number,
+                    "pr_title": pr["title"],
+                    "pr_body": pr.get("body", ""),
+                    "pr_url": pr.get("html_url", ""),
+                    "pr_branch": pr.get("head", {}).get("ref", ""),
+                }, pr_number)
+                if result:
+                    log.info(f"Both approved: PR #{pr_number} — merging")
+            elif last_changes_requested:
+                dispatch_needs_fixes(pr)
+            else:
+                # Dispatch whichever reviewers haven't run yet
+                # Clear handled state so dispatch_qa/dispatch_security can proceed
+                if not has_qa:
+                    state.clear_handled(f"qa-{pr_number}")
+                    dispatch_qa(pr)
+                if not has_sec:
+                    state.clear_handled(f"security-{pr_number}")
+                    dispatch_security(pr)
+        except Exception as e:
+            log.debug(f"Poll PR #{pr_number}: {e}")
 
 
 def run_poller():
@@ -904,104 +1107,24 @@ def repo_cache_loop():
     while True:
         time.sleep(300)
         update_repo_cache()
-
-
-def retry_loop():
-    """Periodically recover stuck work."""
-    while True:
-        time.sleep(600)  # every 10 minutes
+        # Safety net: kill any containers over the global limit
         try:
-            # 1. Pick up issues waiting for agents
-            for issue in gh_get_issues("architect"):
-                dispatch_architect(issue)
-            for issue in gh_get_issues("frontend-dev"):
-                dispatch_frontend_dev(issue)
-            for issue in gh_get_issues("backend-dev"):
-                dispatch_backend_dev(issue)
-
-            # 2. Unstick "dev-in-progress" issues with no running agent
-            with state.lock:
-                active_numbers = {v["number"] for v in state.active_containers.values()}
-            for issue in gh_get_issues("dev-in-progress"):
-                if issue["number"] not in active_numbers:
-                    # Determine the right dev type from the issue body/labels
-                    body = issue.get("body", "") or ""
-                    other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
-                    # Check if it had a PR that was merged (issue is done)
-                    if issue.get("state") == "closed":
-                        continue
-                    # Check if there's already an open PR for this issue
-                    has_open_pr = False
-                    try:
-                        for pr in gh_get_prs("open"):
-                            pr_body = pr.get("body", "") or ""
-                            if f"#{issue['number']}" in pr_body:
-                                has_open_pr = True
-                                break
-                    except Exception:
-                        pass
-                    if has_open_pr:
-                        continue  # PR exists, don't re-spawn dev
-                    # Re-queue: guess dev type from issue title/body or default to frontend
-                    if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
-                        dev_label = "backend-dev"
-                    else:
-                        dev_label = "frontend-dev"
-                    log.info(f"Recovering stuck #{issue['number']} — swapping dev-in-progress → {dev_label}")
-                    gh_remove_label(issue["number"], "dev-in-progress")
-                    gh_add_label(issue["number"], dev_label)
-
-            # 3. Check open PRs for missed approvals
-            for pr in gh_get_prs("open"):
-                if pr.get("draft"):
-                    continue
-                pr_number = pr["number"]
-                key = f"merge-{pr_number}"
-                if key in state.processed:
-                    continue
-                try:
-                    resp = requests.get(
-                        f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-                        headers={"Authorization": f"token {GITHUB_TOKEN}",
-                                 "Accept": "application/vnd.github.v3+json"},
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    comments = resp.json()
-                    has_qa_approval = any(
-                        "QA Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
-                        for c in comments
-                    )
-                    has_security_approval = any(
-                        "Security Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
-                        for c in comments
-                    )
-                    has_changes_requested = any(
-                        "CHANGES REQUESTED" in c.get("body", "").upper()
-                        for c in comments
-                    )
-                    has_any_review = any(
-                        "QA Review" in c.get("body", "") or "Security Review" in c.get("body", "")
-                        for c in comments
-                    )
-                    if has_qa_approval and has_security_approval and not has_changes_requested:
-                        log.info(f"Recovering stuck PR #{pr_number} — both approved, triggering merge")
-                        dispatch_architect_merge(pr)
-                    elif has_changes_requested:
-                        labels = [l["name"] for l in pr.get("labels", [])]
-                        if "needs-fixes" not in labels:
-                            log.info(f"Recovering stuck PR #{pr_number} — changes requested, triggering fixes")
-                            gh_add_label(pr_number, "needs-fixes")
-                            dispatch_needs_fixes(pr)
-                    elif not has_any_review:
-                        log.info(f"Recovering unreviewed PR #{pr_number} — dispatching QA + Security")
-                        dispatch_qa(pr)
-                        dispatch_security(pr)
-                except Exception as e:
-                    log.debug(f"Retry scan PR #{pr_number}: {e}")
-
+            agent_containers = [
+                c for c in docker_client.containers.list(filters={"name": f"{PROJECT_NAME}-"})
+                if not c.name.endswith("-daemon") and not c.name.endswith("-tunnel")
+            ]
+            if len(agent_containers) > MAX_TOTAL_AGENTS:
+                log.warning(f"Safety net: {len(agent_containers)} agents running (limit {MAX_TOTAL_AGENTS}) — stopping excess")
+                # Sort by creation time, keep newest, stop oldest extras
+                agent_containers.sort(key=lambda c: c.attrs.get("Created", ""), reverse=True)
+                for c in agent_containers[MAX_TOTAL_AGENTS:]:
+                    log.warning(f"Stopping excess container: {c.name}")
+                    c.stop(timeout=10)
         except Exception as e:
-            log.debug(f"Retry scan: {e}")
+            log.debug(f"Safety net check: {e}")
+
+
+    # retry_loop removed — poll_github handles everything directly
 
 
 # ─── Status ──────────────────────────────────────────────
@@ -1031,111 +1154,38 @@ def main():
 
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
+    # Clean up orphaned containers from previous daemon runs
+    log.info("Checking for orphaned containers...")
+    try:
+        for container in docker_client.containers.list(all=True, filters={"name": f"{PROJECT_NAME}-"}):
+            name = container.name
+            # Skip daemon and tunnel containers
+            if name.endswith("-daemon") or name.endswith("-tunnel"):
+                continue
+            if container.status == "running":
+                log.info(f"Stopping orphaned container: {name}")
+                container.stop(timeout=10)
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+        log.info("✓ Cleanup complete")
+    except Exception as e:
+        log.warning(f"Cleanup failed: {e}")
+
     log.info("Setting up repo cache...")
     update_repo_cache()
     log.info("✓ Repo cache ready")
 
     threading.Thread(target=repo_cache_loop, daemon=True).start()
-    threading.Thread(target=retry_loop, daemon=True).start()
 
-    # Pick up any stuck or pending work on startup
-    log.info("Scanning for pending and stuck work...")
+    # Initial scan — same as a normal poll cycle
+    log.info("Initial scan...")
     try:
-        # Issues ready to go
-        for issue in gh_get_issues("architect"):
-            dispatch_architect(issue)
-        for issue in gh_get_issues("frontend-dev"):
-            dispatch_frontend_dev(issue)
-        for issue in gh_get_issues("backend-dev"):
-            dispatch_backend_dev(issue)
-
-        # Stuck dev-in-progress issues (agent finished but label not swapped back)
-        for issue in gh_get_issues("dev-in-progress"):
-            if issue.get("state") == "closed":
-                continue
-            # Check if there's already an open PR for this issue
-            has_open_pr = False
-            try:
-                for pr in gh_get_prs("open"):
-                    pr_body = pr.get("body", "") or ""
-                    if f"#{issue['number']}" in pr_body:
-                        has_open_pr = True
-                        break
-            except Exception:
-                pass
-            if has_open_pr:
-                continue
-            body = issue.get("body", "") or ""
-            other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
-            if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
-                dev_label = "backend-dev"
-            else:
-                dev_label = "frontend-dev"
-            log.info(f"Recovering stuck #{issue['number']} — swapping dev-in-progress → {dev_label}")
-            gh_remove_label(issue["number"], "dev-in-progress")
-            gh_add_label(issue["number"], dev_label)
-            # Dispatch immediately
-            issue_copy = dict(issue)
-            issue_copy["labels"] = [{"name": dev_label}]
-            if dev_label == "frontend-dev":
-                dispatch_frontend_dev(issue_copy)
-            else:
-                dispatch_backend_dev(issue_copy)
-
-        # Open PRs with missed approvals or changes-requested
-        for pr in gh_get_prs("open"):
-            if pr.get("draft"):
-                continue
-            pr_number = pr["number"]
-            try:
-                resp = requests.get(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-                    headers={"Authorization": f"token {GITHUB_TOKEN}",
-                             "Accept": "application/vnd.github.v3+json"},
-                )
-                if resp.status_code != 200:
-                    continue
-                comments = resp.json()
-                has_qa_approval = any(
-                    "QA Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
-                    for c in comments
-                )
-                has_security_approval = any(
-                    "Security Review" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", ""))
-                    for c in comments
-                )
-                has_changes_requested = any(
-                    "CHANGES REQUESTED" in c.get("body", "").upper()
-                    for c in comments
-                )
-                has_any_review = any(
-                    "QA Review" in c.get("body", "") or "Security Review" in c.get("body", "")
-                    for c in comments
-                )
-                if has_qa_approval and has_security_approval and not has_changes_requested:
-                    log.info(f"Recovering stuck PR #{pr_number} — both approved, triggering merge")
-                    dispatch_architect_merge(pr)
-                elif has_changes_requested:
-                    labels = [l["name"] for l in pr.get("labels", [])]
-                    if "needs-fixes" not in labels:
-                        log.info(f"Recovering stuck PR #{pr_number} — changes requested, triggering fixes")
-                        gh_add_label(pr_number, "needs-fixes")
-                        dispatch_needs_fixes(pr)
-                elif not has_any_review:
-                    # No review at all — dispatch QA + Security
-                    log.info(f"Recovering unreviewed PR #{pr_number} — dispatching QA + Security")
-                    dispatch_qa(pr)
-                    dispatch_security(pr)
-            except Exception as e:
-                log.debug(f"Startup PR scan #{pr_number}: {e}")
-
-        queue_size = len(state.dev_queue)
-        if queue_size:
-            log.info(f"✓ {queue_size} issue(s) queued")
-        else:
-            log.info("✓ Scan complete")
+        poll_github()
+        log.info("✓ Scan complete")
     except Exception as e:
-        log.warning(f"Startup scan failed: {e}")
+        log.warning(f"Initial scan failed: {e}", exc_info=True)
 
     if MODE == "webhook":
         run_webhook_server()

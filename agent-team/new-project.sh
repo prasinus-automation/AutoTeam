@@ -110,6 +110,7 @@ COMPOSE := docker compose -f $(AGENT_TEAM_DIR)/docker-compose.yml -p $(COMPOSE_P
 .PHONY: up down logs status tunnel-url health build init-repo clean
 
 up:
+	$(COMPOSE) build daemon
 	$(COMPOSE) up -d daemon tunnel
 	@sleep 3
 	@echo ""
