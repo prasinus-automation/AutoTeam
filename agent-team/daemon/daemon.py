@@ -965,6 +965,20 @@ def poll_github():
     for issue in gh_get_issues("backend-dev"):
         dispatch_backend_dev(issue)
 
+    # Recover labeled issues that were handled but have no agent running and no PR.
+    # This catches cases where an agent failed before swapping labels (e.g., rate limit
+    # on first attempt, container crash before label change).
+    with state.lock:
+        active_numbers = {v["number"] for v in state.active_containers.values()}
+    for label, dispatch_fn in [("frontend-dev", dispatch_frontend_dev), ("backend-dev", dispatch_backend_dev)]:
+        for issue in gh_get_issues(label):
+            number = issue["number"]
+            key = f"{label}-{number}"
+            if key in state.processed and number not in active_numbers and not gh_issue_has_open_pr(number):
+                log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
+                state.clear_handled(key)
+                dispatch_fn(issue)
+
     # Stuck dev-in-progress issues (no agent running, no open PR)
     with state.lock:
         active_numbers = {v["number"] for v in state.active_containers.values()}
