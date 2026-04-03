@@ -121,6 +121,8 @@ volumes:
     name: ${COMPOSE_PROJECT_NAME:-agent-team}_repo-cache
   agent-logs:
     name: ${COMPOSE_PROJECT_NAME:-agent-team}_agent-logs
+  agent-memory:
+    name: ${COMPOSE_PROJECT_NAME:-agent-team}_agent-memory
 
 networks:
   agent-net:

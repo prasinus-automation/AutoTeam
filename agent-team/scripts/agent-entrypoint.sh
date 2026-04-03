@@ -89,16 +89,81 @@ The following is project-specific context maintained by the Architect. Follow th
 ${PROJECT_CONTEXT}"
 fi
 
+# ─── Load agent memory ──────────────────────────────────
+MEMORY_DIR="/memory"
+MEMORY_CONTEXT=""
+
+if [ -d "${MEMORY_DIR}" ]; then
+    # 1. Agent's own run log (last 100 lines to cap prompt size)
+    AGENT_LOG="${MEMORY_DIR}/agents/${ROLE}/log.md"
+    if [ -f "${AGENT_LOG}" ] && [ -s "${AGENT_LOG}" ]; then
+        AGENT_LOG_CONTENT=$(tail -100 "${AGENT_LOG}")
+        MEMORY_CONTEXT="${MEMORY_CONTEXT}
+
+## Your Previous Runs
+${AGENT_LOG_CONTENT}"
+        echo "✓ Agent memory loaded ($(wc -l < "${AGENT_LOG}") lines)"
+    fi
+
+    # 2. Issue/PR-specific notes (extract number from task JSON)
+    ISSUE_NUMBER=$(echo "${TASK_CONTENT}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('issue_number') or d.get('pr_number') or '')" 2>/dev/null || true)
+    if [ -n "${ISSUE_NUMBER}" ]; then
+        NOTES_FILE="${MEMORY_DIR}/issues/${ISSUE_NUMBER}/notes.md"
+        if [ -f "${NOTES_FILE}" ] && [ -s "${NOTES_FILE}" ]; then
+            MEMORY_CONTEXT="${MEMORY_CONTEXT}
+
+## Notes from Other Agents (Issue/PR #${ISSUE_NUMBER})
+$(cat "${NOTES_FILE}")"
+            echo "✓ Issue #${ISSUE_NUMBER} notes loaded"
+        fi
+    fi
+
+    # 3. Inbox messages
+    INBOX_DIR="${MEMORY_DIR}/inbox/${ROLE}"
+    if [ -d "${INBOX_DIR}" ] && [ "$(ls -A "${INBOX_DIR}" 2>/dev/null | grep -v '^read$')" ]; then
+        INBOX_CONTENT=""
+        for msg in "${INBOX_DIR}"/*.md; do
+            [ -f "$msg" ] || continue
+            INBOX_CONTENT="${INBOX_CONTENT}
+---
+$(cat "$msg")"
+        done
+        if [ -n "${INBOX_CONTENT}" ]; then
+            MEMORY_CONTEXT="${MEMORY_CONTEXT}
+
+## Inbox Messages
+${INBOX_CONTENT}"
+            echo "✓ Inbox messages loaded"
+        fi
+        # Mark messages as read
+        mkdir -p "${INBOX_DIR}/read"
+        mv "${INBOX_DIR}"/*.md "${INBOX_DIR}/read/" 2>/dev/null || true
+    fi
+fi
+
+# Append memory to system prompt
+if [ -n "${MEMORY_CONTEXT}" ]; then
+    FULL_SYSTEM_PROMPT="${FULL_SYSTEM_PROMPT}
+
+---
+
+# Agent Memory
+
+The following is your persistent memory from previous runs. Use it to avoid repeating mistakes, build on what worked, and coordinate with other agents.
+${MEMORY_CONTEXT}"
+fi
+
 # ─── Run Claude Code ─────────────────────────────────────
 echo ""
 echo "─── Starting Claude Code ────────────────"
 echo ""
 
 # Claude Code runs with:
-#   - The role-specific system prompt (+ project context from AGENTS.md)
+#   - The role-specific system prompt (+ project context from AGENTS.md + memory)
 #   - The task context
 #   - Access to the working directory (repo)
 #   - GitHub token for API operations
+#   - Read-write access to /memory for persisting state
 
 echo "${TASK_CONTENT}" | claude --print \
     --system-prompt "${FULL_SYSTEM_PROMPT}" \

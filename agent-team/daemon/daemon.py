@@ -51,6 +51,7 @@ TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # 
 LOG_DIR = os.environ.get("LOG_DIR", "/logs")
 REPO_CACHE_VOLUME = os.environ.get("REPO_CACHE_VOLUME", "agent-team_repo-cache")
 PROJECT_NAME = os.environ.get("COMPOSE_PROJECT_NAME", "agent-team")
+MEMORY_VOLUME = f"{PROJECT_NAME}_agent-memory"
 MAX_TOTAL_AGENTS = int(os.environ.get("MAX_TOTAL_AGENTS", "3"))
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -286,6 +287,7 @@ def spawn_agent(role, task_context, issue_or_pr_number):
         volumes = {
             REPO_CACHE_VOLUME: {"bind": "/repo", "mode": "ro"},
             host_task_dir: {"bind": "/tmp/task", "mode": "ro"},
+            MEMORY_VOLUME: {"bind": "/memory", "mode": "rw"},
         }
         # Mount Claude subscription credentials if provided (instead of API key)
         if CLAUDE_CREDENTIALS_PATH and os.path.exists(CLAUDE_CREDENTIALS_PATH):
@@ -652,6 +654,61 @@ def dispatch_security(pr):
         state.clear_handled(key)
 
 
+def _latest_reviews_approved(pr_number):
+    """Check if the latest QA and Security comments are approvals (not changes requested).
+    Returns True if both have reviewed and both approved, meaning no fixes are needed."""
+    try:
+        resp = requests.get(
+            f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+            headers=HEADERS,
+            params={"per_page": 100},
+        )
+        if resp.status_code != 200:
+            return False
+        # Follow pagination to last page for heavily-commented PRs
+        link_header = resp.headers.get("Link", "")
+        if 'rel="last"' in link_header:
+            last_match = re.search(r'<([^>]+)>;\s*rel="last"', link_header)
+            if last_match:
+                last_resp = requests.get(last_match.group(1), headers=HEADERS)
+                if last_resp.status_code == 200:
+                    comments = last_resp.json()
+                else:
+                    comments = resp.json()
+            else:
+                comments = resp.json()
+        else:
+            comments = resp.json()
+
+        last_qa_approved = False
+        last_sec_approved = False
+        has_qa = False
+        has_sec = False
+        for c in reversed(comments):
+            body = c.get("body", "")
+            if "Daemon-verified:" in body or "Agent `" in body:
+                continue
+            # Only check the first line (header) for verdict to avoid false positives
+            # from ✅ checkmarks in the body of CHANGES REQUESTED reviews
+            header = body.split("\n")[0] if body else ""
+            if "QA Review" in header and not has_qa:
+                has_qa = True
+                if "CHANGES REQUESTED" in header.upper():
+                    last_qa_approved = False
+                else:
+                    last_qa_approved = "APPROVED" in header.upper() or "✅" in header
+            if "Security Review" in header and not has_sec:
+                has_sec = True
+                if "CHANGES REQUESTED" in header.upper():
+                    last_sec_approved = False
+                else:
+                    last_sec_approved = "APPROVED" in header.upper() or "✅" in header
+
+        return has_qa and last_qa_approved and has_sec and last_sec_approved
+    except Exception:
+        return False
+
+
 def dispatch_needs_fixes(pr):
     """Re-spawn the right dev agent with review feedback context."""
     number = pr["number"]
@@ -664,6 +721,12 @@ def dispatch_needs_fixes(pr):
         dev_role = "backend-dev"
     else:
         log.warning(f"PR #{number} branch '{branch}' has no frontend/ or backend/ prefix — skipping")
+        return
+
+    # If the latest reviews are both approvals, the fix is already applied — skip
+    if _latest_reviews_approved(number):
+        log.info(f"PR #{number} — latest reviews are approvals, skipping fix dispatch")
+        gh_remove_label(number, "needs-fixes")
         return
 
     # Check iteration limit — count existing fix commits in PR comments to survive restarts
@@ -892,7 +955,9 @@ def handle_webhook_event(event, payload):
                 return
             pr_number = issue["number"]
             pr_url = issue["pull_request"].get("url", "")
-            if "CHANGES REQUESTED" in comment_body.upper() or "❌" in comment_body:
+            # Check the header line only to avoid false positives from ✅ in body
+            comment_header = comment_body.split("\n")[0] if comment_body else ""
+            if "CHANGES REQUESTED" in comment_header.upper() or "❌" in comment_header:
                 # QA or Security requested changes — add label and trigger fix flow
                 log.info(f"Changes requested on PR #{pr_number} via comment")
                 gh_add_label(pr_number, "needs-fixes")
@@ -906,7 +971,7 @@ def handle_webhook_event(event, payload):
                         dispatch_needs_fixes(pr_resp.json())
                 except Exception as e:
                     log.error(f"Error triggering fixes for PR #{pr_number}: {e}")
-            elif "APPROVED" in comment_body.upper() or "✅" in comment_body:
+            elif "APPROVED" in comment_header.upper() or "✅" in comment_header:
                 if pr_url:
                     _check_both_approved(pr_number, pr_url, comment_body)
 
@@ -920,6 +985,32 @@ def handle_webhook_event(event, payload):
     # ── Ping (setup confirmation) ─────────────────────
     elif event == "ping":
         log.info(f"Webhook connected: {repo}")
+
+
+def webhook_retry_loop():
+    """Background loop for webhook mode: retries agents after transient error backoff,
+    and runs a periodic safety-net poll to recover stuck issues."""
+    poll_counter = 0
+    while True:
+        time.sleep(60)
+        poll_counter += 1
+        try:
+            # Check for expired backoffs
+            has_expired = False
+            with state.lock:
+                now = datetime.now(timezone.utc)
+                for key, until in list(state.retry_backoff_until.items()):
+                    if now >= until:
+                        has_expired = True
+                        break
+
+            # Run poll if backoff expired OR every 5 minutes as a safety net
+            if has_expired or poll_counter % 5 == 0:
+                if has_expired:
+                    log.info("Retry loop: backoff expired, running poll to recover")
+                poll_github()
+        except Exception as e:
+            log.debug(f"Retry loop: {e}")
 
 
 def run_webhook_server():
@@ -978,6 +1069,16 @@ def poll_github():
                 log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
                 state.clear_handled(key)
                 dispatch_fn(issue)
+
+    # Stuck architect-in-progress issues (no agent running)
+    with state.lock:
+        active_numbers = {v["number"] for v in state.active_containers.values()}
+    for issue in gh_get_issues("architect-in-progress"):
+        if issue.get("state") == "closed" or issue["number"] in active_numbers:
+            continue
+        log.info(f"Recovering stuck architect #{issue['number']}")
+        gh_remove_label(issue["number"], "architect-in-progress")
+        gh_add_label(issue["number"], "architect")
 
     # Stuck dev-in-progress issues (no agent running, no open PR)
     with state.lock:
@@ -1039,16 +1140,21 @@ def poll_github():
                 # Skip daemon-generated comments — only trust agent-posted reviews
                 if "Daemon-verified:" in body or "Agent `" in body:
                     continue
-                if "QA Review" in body and not has_qa:
+                # Only check the first line (header) for verdict to avoid false positives
+                # from ✅ checkmarks in the body of CHANGES REQUESTED reviews
+                header = body.split("\n")[0] if body else ""
+                if "QA Review" in header and not has_qa:
                     has_qa = True
-                    last_qa_approved = "APPROVED" in body.upper() or "✅" in body
-                    if "CHANGES REQUESTED" in body.upper():
+                    if "CHANGES REQUESTED" in header.upper():
                         last_changes_requested = True
-                if "Security Review" in body and not has_sec:
+                    else:
+                        last_qa_approved = "APPROVED" in header.upper() or "✅" in header
+                if "Security Review" in header and not has_sec:
                     has_sec = True
-                    last_sec_approved = "APPROVED" in body.upper() or "✅" in body
-                    if "CHANGES REQUESTED" in body.upper():
+                    if "CHANGES REQUESTED" in header.upper():
                         last_changes_requested = True
+                    else:
+                        last_sec_approved = "APPROVED" in header.upper() or "✅" in header
 
             if last_qa_approved and last_sec_approved and not last_changes_requested:
                 # Both approved — merge
@@ -1117,10 +1223,39 @@ def update_repo_cache():
         log.error(f"Repo cache update failed: {e}")
 
 
+def cleanup_memory():
+    """Trim agent memory to prevent unbounded growth."""
+    try:
+        docker_client.containers.run(
+            image="agent-base:latest",
+            entrypoint="bash",
+            command=["-c", """
+                # Trim agent logs to last 200 lines each
+                for f in /memory/agents/*/log.md; do
+                    [ -f "$f" ] || continue
+                    lines=$(wc -l < "$f")
+                    if [ "$lines" -gt 200 ]; then
+                        tail -200 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                    fi
+                done
+                # Delete read inbox messages older than 7 days
+                find /memory/inbox/*/read/ -name "*.md" -mtime +7 -delete 2>/dev/null
+                # Delete issue notes for issues not active in 30 days
+                find /memory/issues/ -name "notes.md" -mtime +30 -delete 2>/dev/null
+                find /memory/issues/ -type d -empty -delete 2>/dev/null
+            """],
+            volumes={MEMORY_VOLUME: {"bind": "/memory", "mode": "rw"}},
+            remove=True,
+        )
+    except Exception as e:
+        log.debug(f"Memory cleanup: {e}")
+
+
 def repo_cache_loop():
     while True:
         time.sleep(300)
         update_repo_cache()
+        cleanup_memory()
         # Safety net: kill any containers over the global limit
         try:
             agent_containers = [
@@ -1191,6 +1326,23 @@ def main():
     update_repo_cache()
     log.info("✓ Repo cache ready")
 
+    log.info("Setting up agent memory volume...")
+    try:
+        docker_client.containers.run(
+            image="agent-base:latest",
+            entrypoint="bash",
+            command=["-c",
+                "mkdir -p /memory/agents/{architect,frontend-dev,backend-dev,qa,security} "
+                "/memory/inbox/{architect,frontend-dev,backend-dev,qa,security} "
+                "/memory/issues"
+            ],
+            volumes={MEMORY_VOLUME: {"bind": "/memory", "mode": "rw"}},
+            remove=True,
+        )
+        log.info("✓ Agent memory ready")
+    except Exception as e:
+        log.warning(f"Memory setup failed: {e}")
+
     threading.Thread(target=repo_cache_loop, daemon=True).start()
 
     # Initial scan — same as a normal poll cycle
@@ -1202,6 +1354,7 @@ def main():
         log.warning(f"Initial scan failed: {e}", exc_info=True)
 
     if MODE == "webhook":
+        threading.Thread(target=webhook_retry_loop, daemon=True).start()
         run_webhook_server()
     else:
         run_poller()

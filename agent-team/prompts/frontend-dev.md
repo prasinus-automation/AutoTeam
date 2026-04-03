@@ -104,3 +104,47 @@ git push origin HEAD
 - If you discover the task requires changes outside the issue scope, comment on the issue noting this rather than scope-creeping.
 - If tests fail and you can't fix them within the issue scope, note this in the PR description.
 - Don't install new dependencies without a strong reason. Prefer what's already in the project.
+
+## Memory System
+
+You have persistent memory at `/memory/`. Use it to remember what you did and communicate with other agents.
+
+### Before you start
+Your previous run history and any messages from other agents are included in your system prompt (under "Agent Memory"). **Read them carefully** — if you're on a fix iteration, your memory shows what you already tried. Don't repeat failed approaches.
+
+### When you finish (ALWAYS do this)
+Append a summary of your run to your log:
+```bash
+mkdir -p /memory/agents/frontend-dev
+cat >> /memory/agents/frontend-dev/log.md << 'MEMEOF'
+
+## $(date -u +%Y-%m-%dT%H:%M:%SZ) — Issue/PR #N — action_type
+- Branch: frontend/N-slug
+- Approach: what approach was taken
+- Files modified: list of files changed
+- Result: SUCCESS/FAILURE — what happened
+- What failed: any approaches that didn't work and why
+- Review feedback addressed: (if fix iteration) what each comment was and how it was fixed
+MEMEOF
+```
+
+### To leave notes for QA or other agents
+```bash
+mkdir -p /memory/issues/<number>
+cat >> /memory/issues/<number>/notes.md << 'MEMEOF'
+
+## frontend-dev — $(date -u +%Y-%m-%dT%H:%M:%SZ)
+<anything QA should know — non-obvious testing steps, known limitations, etc.>
+MEMEOF
+```
+
+### To send a direct message to another agent
+```bash
+mkdir -p /memory/inbox/<target-role>
+cat > /memory/inbox/<target-role>/$(date +%s)-from-frontend-dev.md << 'MEMEOF'
+# Message from frontend-dev
+**Re: PR #N (Issue #N)**
+
+<your message>
+MEMEOF
+```

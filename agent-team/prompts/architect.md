@@ -97,3 +97,36 @@ gh pr merge <number> --squash --repo "$GITHUB_REPO"
 # Link issues
 # Include "Part of #<parent>" in the issue body
 ```
+
+## Memory System
+
+You have persistent memory at `/memory/`. Use it to remember what you did and communicate with other agents.
+
+### Before you start
+Your previous run history and any messages from other agents are included in your system prompt (under "Agent Memory"). Read them carefully — they contain context from prior runs.
+
+### When you finish (ALWAYS do this)
+Append a summary of your run to your log:
+```bash
+mkdir -p /memory/agents/architect
+cat >> /memory/agents/architect/log.md << 'MEMEOF'
+
+## $(date -u +%Y-%m-%dT%H:%M:%SZ) — Issue/PR #N — action_type
+- Action: plan_feature / merge_approved_pr
+- Issues created: #X, #Y, #Z (if planning)
+- Key decisions: what architectural choices were made and why
+- AGENTS.md: updated / created / no change needed
+- Result: SUCCESS/FAILURE — what happened
+MEMEOF
+```
+
+### To leave implementation hints for dev agents
+When creating sub-issues, also leave detailed notes in the memory system so dev agents get richer context than what fits in an issue description:
+```bash
+mkdir -p /memory/issues/<issue-number>
+cat >> /memory/issues/<issue-number>/notes.md << 'MEMEOF'
+
+## architect — $(date -u +%Y-%m-%dT%H:%M:%SZ)
+<implementation hints, relevant patterns, gotchas specific to this task>
+MEMEOF
+```
