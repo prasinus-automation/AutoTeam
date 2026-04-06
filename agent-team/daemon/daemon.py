@@ -256,8 +256,9 @@ def spawn_agent(role, task_context, issue_or_pr_number):
             remaining = int((backoff_until - datetime.now(timezone.utc)).total_seconds())
             log.debug(f"Skipping {role} for #{issue_or_pr_number} — backoff ({remaining}s remaining)")
             return None
-        # Global concurrency limit (QA/Security are lightweight, exempt them)
-        if role not in ("qa", "security") and len(state.active_containers) >= MAX_TOTAL_AGENTS:
+        # Global concurrency limit (QA/Security are lightweight, exempt them;
+        # architect merges are quick and critical, exempt them too)
+        if role not in ("qa", "security", "architect") and len(state.active_containers) >= MAX_TOTAL_AGENTS:
             log.info(f"Max agents ({MAX_TOTAL_AGENTS}) reached — deferring {role} for #{issue_or_pr_number}")
             return None
 
@@ -785,7 +786,7 @@ def dispatch_architect_merge(pr):
         return
 
     log.info(f"Both approved: PR #{number} — spawning Architect to merge")
-    spawn_agent("architect", {
+    result = spawn_agent("architect", {
         "action": "merge_approved_pr",
         "pr_number": number,
         "pr_title": pr["title"],
@@ -793,6 +794,9 @@ def dispatch_architect_merge(pr):
         "pr_url": pr.get("html_url", ""),
         "pr_branch": pr.get("head", {}).get("ref", ""),
     }, number)
+    if result is None:
+        # Spawn failed — clear handled state so it retries on next poll
+        state.clear_handled(key)
 
 
 def _check_both_approved(pr_number, pr_api_url, latest_comment):
