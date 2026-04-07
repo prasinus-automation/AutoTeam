@@ -223,6 +223,7 @@ class DaemonState:
         self.retry_counts = {}  # "role-number" -> transient retry count
         self.retry_backoff_until = {}  # "role-number" -> datetime to wait until
         self.dev_queue = []  # list of (role, issue) waiting for a slot
+        self.pending_fix_prs = set()  # PR numbers whose fix dispatch was deferred
         self.lock = threading.Lock()
 
     def already_handled(self, key):
@@ -256,11 +257,18 @@ def spawn_agent(role, task_context, issue_or_pr_number):
             remaining = int((backoff_until - datetime.now(timezone.utc)).total_seconds())
             log.debug(f"Skipping {role} for #{issue_or_pr_number} — backoff ({remaining}s remaining)")
             return None
-        # Global concurrency limit (QA/Security are lightweight, exempt them;
-        # architect merges are quick and critical, exempt them too)
-        if role not in ("qa", "security", "architect") and len(state.active_containers) >= MAX_TOTAL_AGENTS:
-            log.info(f"Max agents ({MAX_TOTAL_AGENTS}) reached — deferring {role} for #{issue_or_pr_number}")
-            return None
+        # Global concurrency limit applies to dev agents only.
+        # QA/security/architect are exempt and are also not counted against
+        # the cap — otherwise an active reviewer would block dev spawns even
+        # when no devs are running.
+        if role not in ("qa", "security", "architect"):
+            dev_count = sum(
+                1 for v in state.active_containers.values()
+                if v.get("role") in ("frontend-dev", "backend-dev")
+            )
+            if dev_count >= MAX_TOTAL_AGENTS:
+                log.info(f"Max dev agents ({MAX_TOTAL_AGENTS}) reached — deferring {role} for #{issue_or_pr_number}")
+                return None
 
     profile = RESOURCE_PROFILES[role]
     container_name = f"{PROJECT_NAME}-{role}-{issue_or_pr_number}-{int(time.time())}"
@@ -330,6 +338,7 @@ def spawn_agent(role, task_context, issue_or_pr_number):
                 "role": role, "number": issue_or_pr_number,
                 "container": container, "name": container_name,
                 "started": datetime.now(timezone.utc),
+                "action": task_context.get("action"),
             }
 
         log.info(f"✓ {container_name} started ({container.short_id})")
@@ -367,6 +376,35 @@ def monitor_container(container_id):
                 state.retry_backoff_until.pop(retry_key, None)
             # Agents post their own review comments directly — no need for
             # daemon-verified duplicates (they spam the PR and break pagination).
+
+            # Architect declined to merge: detect by checking if the PR is
+            # actually merged after an architect-merge agent exits cleanly.
+            # If not merged, the architect chose not to (usually due to schema
+            # drift or arch concerns) — flip the PR back into the fix loop so
+            # a dev gets re-spawned with the architect's feedback.
+            if info["role"] == "architect" and info.get("action") == "merge_approved_pr":
+                pr_number = info["number"]
+                try:
+                    r = requests.get(
+                        f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}",
+                        headers=HEADERS,
+                    )
+                    if r.status_code == 200 and not r.json().get("merged"):
+                        log.warning(f"Architect declined to merge PR #{pr_number} — flipping to needs-fixes")
+                        # Post a synthesizing CHANGES REQUESTED comment so
+                        # _latest_reviews_approved() returns False on the
+                        # next dispatch — otherwise the daemon would skip
+                        # the fix because QA/Security previously approved.
+                        gh_comment(pr_number,
+                                   "## QA Review — CHANGES REQUESTED\n\n"
+                                   "Re-opening review after the architect declined the merge. "
+                                   "See the architect's most recent comment on this PR for the "
+                                   "specific issues that need to be addressed before this can land.")
+                        gh_add_label(pr_number, "needs-fixes")
+                        # Clear merge handled state so it can re-trigger after fix
+                        state.clear_handled(f"merge-{pr_number}")
+                except Exception as e:
+                    log.error(f"Architect-decline check for PR #{pr_number}: {e}")
         else:
             log.warning(f"✗ {info['name']} exited ({exit_code})")
 
@@ -530,9 +568,10 @@ def dispatch_backend_dev(issue):
 
 
 def drain_queue():
-    """Try to dispatch queued issues now that a slot may be free."""
+    """Try to dispatch queued issues and pending PR fixes now that a slot may be free."""
     with state.lock:
         queue_copy = list(state.dev_queue)
+        pending_copy = list(state.pending_fix_prs)
 
     for role, issue in queue_copy:
         if role == "frontend-dev":
@@ -544,6 +583,17 @@ def drain_queue():
             key = f"{role}-{issue['number']}"
             if key in state.processed:
                 state.dev_queue = [(r, i) for r, i in state.dev_queue if not (r == role and i["number"] == issue["number"])]
+
+    # Re-attempt deferred fix dispatches by re-fetching the PR and calling
+    # dispatch_needs_fixes again. dispatch_needs_fixes is idempotent and will
+    # re-park the PR if devs are still saturated.
+    for pr_number in pending_copy:
+        try:
+            r = requests.get(f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}", headers=HEADERS)
+            if r.status_code == 200:
+                dispatch_needs_fixes(r.json())
+        except Exception as e:
+            log.debug(f"drain pending fix #{pr_number}: {e}")
 
 
 def dispatch_dependents(pr):
@@ -728,7 +778,23 @@ def dispatch_needs_fixes(pr):
     if _latest_reviews_approved(number):
         log.info(f"PR #{number} — latest reviews are approvals, skipping fix dispatch")
         gh_remove_label(number, "needs-fixes")
+        with state.lock:
+            state.pending_fix_prs.discard(number)
         return
+
+    # Pre-check capacity. If devs are saturated, park the PR in pending_fix_prs
+    # and bail out WITHOUT incrementing iteration or removing the needs-fixes
+    # label — drain_queue will retry once a dev slot frees up.
+    with state.lock:
+        dev_count = sum(
+            1 for v in state.active_containers.values()
+            if v.get("role") in ("frontend-dev", "backend-dev")
+        )
+        if dev_count >= MAX_TOTAL_AGENTS:
+            if number not in state.pending_fix_prs:
+                state.pending_fix_prs.add(number)
+                log.info(f"PR #{number} fix deferred — devs saturated ({dev_count}/{MAX_TOTAL_AGENTS}), parked in pending")
+            return
 
     # Check iteration limit — count existing fix commits in PR comments to survive restarts
     try:
@@ -776,6 +842,8 @@ def dispatch_needs_fixes(pr):
         "fix_iteration": iterations,
         "review_feedback": feedback,
     }, number)
+    with state.lock:
+        state.pending_fix_prs.discard(number)
 
 
 def dispatch_architect_merge(pr):
@@ -889,6 +957,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         with state.lock:
             active = [{"role": v["role"], "issue": v["number"]}
                       for v in state.active_containers.values()]
+            queue_len = len(state.dev_queue)
+            pending_fixes = sorted(state.pending_fix_prs)
         self.wfile.write(json.dumps({
             "status": "ok",
             "mode": MODE,
@@ -896,6 +966,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "active_agents": active,
             "frontend_dev_slots": f"{state.frontend_dev_count}/{MAX_FRONTEND_AGENTS}",
             "backend_dev_slots": f"{state.backend_dev_count}/{MAX_BACKEND_AGENTS}",
+            "dev_queue_length": queue_len,
+            "pending_fix_prs": pending_fixes,
+            "max_total_agents": MAX_TOTAL_AGENTS,
         }).encode())
 
     def log_message(self, format, *args):
@@ -1260,21 +1333,46 @@ def repo_cache_loop():
         time.sleep(300)
         update_repo_cache()
         cleanup_memory()
-        # Safety net: kill any containers over the global limit
+        # Safety net: kill any containers over the global limit.
+        # The spawn-time check exempts qa/security/architect from the cap, so the
+        # safety net must do the same — otherwise long-running reviewers/mergers
+        # get reaped while devs sit comfortably under the cap.
         try:
-            agent_containers = [
+            all_agents = [
                 c for c in docker_client.containers.list(filters={"name": f"{PROJECT_NAME}-"})
                 if not c.name.endswith("-daemon") and not c.name.endswith("-tunnel")
             ]
-            if len(agent_containers) > MAX_TOTAL_AGENTS:
-                log.warning(f"Safety net: {len(agent_containers)} agents running (limit {MAX_TOTAL_AGENTS}) — stopping excess")
-                # Sort by creation time, keep newest, stop oldest extras
-                agent_containers.sort(key=lambda c: c.attrs.get("Created", ""), reverse=True)
-                for c in agent_containers[MAX_TOTAL_AGENTS:]:
+            EXEMPT_ROLES = ("-qa-", "-security-", "-architect-")
+            dev_containers = [c for c in all_agents if not any(r in c.name for r in EXEMPT_ROLES)]
+            if len(dev_containers) > MAX_TOTAL_AGENTS:
+                log.warning(f"Safety net: {len(dev_containers)} dev agents running (limit {MAX_TOTAL_AGENTS}) — stopping excess")
+                # Kill newest devs first — older devs are further along, more expensive to restart
+                dev_containers.sort(key=lambda c: c.attrs.get("Created", ""))
+                for c in dev_containers[MAX_TOTAL_AGENTS:]:
                     log.warning(f"Stopping excess container: {c.name}")
                     c.stop(timeout=10)
         except Exception as e:
             log.debug(f"Safety net check: {e}")
+
+        # Reconcile state.active_containers against actual docker state.
+        # If a container exited but its monitor thread crashed/never reaped it,
+        # the entry sticks around forever and blocks new spawns. Fix that here.
+        try:
+            live_ids = {c.id for c in docker_client.containers.list()}
+            with state.lock:
+                ghosts = [(cid, info) for cid, info in state.active_containers.items() if cid not in live_ids]
+            if ghosts:
+                log.warning(f"Reconcile: removing {len(ghosts)} ghost container(s) from state")
+                with state.lock:
+                    for cid, info in ghosts:
+                        state.active_containers.pop(cid, None)
+                        if info.get("role") == "frontend-dev":
+                            state.frontend_dev_count = max(0, state.frontend_dev_count - 1)
+                        elif info.get("role") == "backend-dev":
+                            state.backend_dev_count = max(0, state.backend_dev_count - 1)
+                drain_queue()
+        except Exception as e:
+            log.debug(f"Ghost reconcile: {e}")
 
 
     # retry_loop removed — poll_github handles everything directly
