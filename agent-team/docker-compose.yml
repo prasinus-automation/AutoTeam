@@ -43,7 +43,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-logs:/logs
       - /tmp/${COMPOSE_PROJECT_NAME:-agent-team}-tasks:/tmp/agent-tasks
-      - ${CLAUDE_CREDENTIALS_PATH:-/dev/null}:${CLAUDE_CREDENTIALS_PATH:-/dev/null}:ro
+      # Mount the parent directory of the credentials file (not the file
+      # itself). Atomic-rename refreshes by Claude Code on the host change
+      # the inode, which would orphan a file-level bind mount. The daemon
+      # reads CLAUDE_CREDENTIALS_PATH against the host path, which is also
+      # valid inside the container because the directory is mounted at the
+      # same path.
+      - ${CLAUDE_CREDENTIALS_DIR:-/dev/null}:${CLAUDE_CREDENTIALS_DIR:-/dev/null}:ro
     networks:
       - agent-net
 

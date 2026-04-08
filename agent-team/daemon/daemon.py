@@ -73,6 +73,48 @@ logging.basicConfig(
 )
 log = logging.getLogger("daemon")
 
+
+# ─── Credentials ─────────────────────────────────────────
+
+def _credentials_status():
+    """Inspect the Claude OAuth credentials file the daemon is mounting and
+    report whether it is valid, expiring soon, or fully expired. Reads the
+    file fresh on each call so that token refreshes on the host are picked
+    up immediately. Returns a dict suitable for the /health endpoint."""
+    if ANTHROPIC_API_KEY:
+        return {"mode": "api_key", "expired": False}
+    if not CLAUDE_CREDENTIALS_PATH:
+        return {"mode": "none", "expired": True, "reason": "no credentials configured"}
+    if not os.path.exists(CLAUDE_CREDENTIALS_PATH):
+        return {"mode": "oauth", "expired": True, "reason": "credentials file missing"}
+    try:
+        # Re-open by path each call so that an inode-rotated file is read
+        # fresh, not via a stale fd.
+        with open(CLAUDE_CREDENTIALS_PATH) as f:
+            data = json.load(f)
+        oauth = data.get("claudeAiOauth") or {}
+        expires_at_ms = oauth.get("expiresAt")
+        if not expires_at_ms:
+            return {"mode": "oauth", "expired": True, "reason": "expiresAt missing"}
+        expires_at = datetime.fromtimestamp(expires_at_ms / 1000, timezone.utc)
+        now = datetime.now(timezone.utc)
+        remaining_seconds = int((expires_at - now).total_seconds())
+        return {
+            "mode": "oauth",
+            "expired": remaining_seconds <= 0,
+            "expires_at": expires_at.isoformat(),
+            "remaining_seconds": remaining_seconds,
+            # Claude Code refreshes the access token automatically using the
+            # refresh token in the same file. The refresh token outlives the
+            # access token by weeks. We treat the access token being expired
+            # as a soft signal — the real failure is when the refresh token
+            # also dies, which surfaces as auth errors at agent runtime.
+            "has_refresh_token": bool(oauth.get("refreshToken")),
+        }
+    except Exception as e:
+        return {"mode": "oauth", "expired": True, "reason": f"read error: {e}"}
+
+
 # ─── GitHub API ──────────────────────────────────────────
 
 API = "https://api.github.com"
@@ -298,11 +340,16 @@ def spawn_agent(role, task_context, issue_or_pr_number):
             host_task_dir: {"bind": "/tmp/task", "mode": "ro"},
             MEMORY_VOLUME: {"bind": "/memory", "mode": "rw"},
         }
-        # Mount Claude subscription credentials if provided (instead of API key)
+        # Mount Claude subscription credentials directory (not the file).
+        # Claude Code refreshes the credentials file via atomic rename, which
+        # changes the inode. A bind mount of the file itself is pinned to the
+        # original inode forever, so refreshed tokens never reach agents and
+        # the daemon ends up serving expired credentials until restart. Mount
+        # the parent directory instead and let the entrypoint copy the file
+        # into place at startup — directory mounts always see fresh inodes.
         if CLAUDE_CREDENTIALS_PATH and os.path.exists(CLAUDE_CREDENTIALS_PATH):
-            volumes[CLAUDE_CREDENTIALS_PATH] = {
-                "bind": "/root/.claude/.credentials.json", "mode": "ro",
-            }
+            cred_dir = os.path.dirname(CLAUDE_CREDENTIALS_PATH)
+            volumes[cred_dir] = {"bind": "/host-claude", "mode": "ro"}
 
         # Increment dev count before spawning to prevent race conditions
         with state.lock:
@@ -969,6 +1016,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "dev_queue_length": queue_len,
             "pending_fix_prs": pending_fixes,
             "max_total_agents": MAX_TOTAL_AGENTS,
+            "credentials": _credentials_status(),
         }).encode())
 
     def log_message(self, format, *args):

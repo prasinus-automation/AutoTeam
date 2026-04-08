@@ -30,6 +30,11 @@ RUN git config --global user.email "agent@agent-team.local" \
 # Default working directory
 WORKDIR /work
 
+# Shared Claude Code subagent library — copied into each agent's working
+# directory at startup by the entrypoint, so every spawned agent has access
+# to Explore, schema-auditor, test-runner, and any future shared subagents.
+COPY claude-agents/ /agent-team-claude-agents/
+
 # Entrypoint script that all agents share
 COPY scripts/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh

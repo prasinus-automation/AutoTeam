@@ -18,6 +18,18 @@ echo "  Task:  ${TASK_FILE}"
 echo "  Time:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "═══════════════════════════════════════"
 
+# ─── Copy Claude credentials from host directory mount ──
+# The daemon mounts /host-claude (the host's ~/.claude directory) read-only
+# instead of bind-mounting the credentials file directly. This avoids the
+# inode-pinning bug where atomic-rename refreshes on the host never reach
+# the container. Copy the latest credentials file into place each time the
+# agent starts so we always pick up the most recent token.
+if [ -f /host-claude/.credentials.json ]; then
+    mkdir -p /root/.claude
+    cp /host-claude/.credentials.json /root/.claude/.credentials.json
+    chmod 600 /root/.claude/.credentials.json
+fi
+
 # ─── Authenticate with GitHub ────────────────────────────
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     # gh CLI automatically uses GITHUB_TOKEN env var for auth
@@ -51,6 +63,21 @@ else
         git clone "https://github.com/${GITHUB_REPO}.git" "${WORK_DIR}"
         cd "${WORK_DIR}"
     fi
+fi
+
+# ─── Install shared subagent library ────────────────────
+# Claude Code reads project-scoped subagents from .claude/agents/ in the
+# current working directory. Copy the AutoTeam shared library into place
+# (without clobbering anything the project already ships) so every agent
+# has access to Explore, schema-auditor, test-runner, etc. The library
+# was baked into the image at /agent-team-claude-agents during the
+# Dockerfile.base build.
+if [ -d /agent-team-claude-agents ]; then
+    mkdir -p "${WORK_DIR}/.claude/agents"
+    # -n = no clobber: project's own subagents win if names collide.
+    cp -nr /agent-team-claude-agents/. "${WORK_DIR}/.claude/agents/" 2>/dev/null || true
+    count=$(ls "${WORK_DIR}/.claude/agents/" 2>/dev/null | wc -l)
+    echo "✓ Subagent library installed (${count} subagents available)"
 fi
 
 # ─── Build the task prompt ───────────────────────────────

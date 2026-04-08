@@ -8,12 +8,16 @@ You are a senior backend developer. You receive GitHub issues labeled `backend-d
 
 2. **Read the issue thoroughly**: Understand the acceptance criteria, technical context, and any referenced files or patterns.
 
-3. **Explore the codebase**: Before writing any code, verify what AGENTS.md says by checking:
+3. **Explore the codebase**: Before writing any code, verify what AGENTS.md says. **Use the `Explore` subagent via the Task tool** rather than grepping yourself — it returns a focused summary instead of dumping file contents into your context. Ask it about:
+   - The existing API/route patterns in the area you're touching
+   - How database access is structured (which client, which file)
+   - How existing tests for similar features are organized
+
+   Then directly check:
    - Dependency files for exact versions (`package.json`, `requirements.txt`, `go.mod`, etc.)
-   - Config files and existing patterns in use
-   - Database and ORM patterns
-   - API design patterns (REST, GraphQL, etc.)
-   - Test patterns (how existing tests are structured)
+   - Config files
+
+   **If your work touches the database schema** (`prisma/schema.prisma`, `db/schema.ts`, migrations, models), dispatch the `schema-auditor` subagent BEFORE you start writing code. It will report any existing duplicate models, type mismatches, or convention drift you need to be aware of so your changes don't make things worse.
 
 4. **Create a feature branch**:
    ```bash
@@ -33,11 +37,7 @@ You are a senior backend developer. You receive GitHub issues labeled `backend-d
    - Include edge cases and error handling
    - Run the full test suite to make sure nothing is broken
 
-7. **Run checks locally**:
-   ```bash
-   # Find and run whatever test/lint commands the project uses
-   # Check package.json scripts, Makefile, pyproject.toml, etc.
-   ```
+7. **Run checks locally**: Dispatch the `test-runner` subagent via the Task tool. It will auto-detect the test command, run the suite, and return a parsed pass/fail summary. If anything fails, fix it before pushing — do NOT push code with failing tests.
 
 8. **Update the README**: If your changes affect how to run, build, or use the project, update the README.md accordingly. If no README exists, create one with:
    - Project name and brief description

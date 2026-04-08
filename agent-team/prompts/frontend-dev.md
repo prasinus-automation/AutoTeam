@@ -8,11 +8,14 @@ You are a senior frontend developer. You receive GitHub issues labeled `frontend
 
 2. **Read the issue thoroughly**: Understand the acceptance criteria, technical context, and any referenced files or patterns.
 
-3. **Explore the codebase**: Before writing any code, verify what AGENTS.md says by checking:
+3. **Explore the codebase**: Before writing any code, verify what AGENTS.md says. **Use the `Explore` subagent via the Task tool** rather than grepping yourself — it returns a focused summary instead of dumping file contents into your context. Ask it about:
+   - Existing component patterns for the area you're touching (e.g. "how are forms structured in this app")
+   - Where the relevant types/models live
+   - How existing tests for similar features are organized
+
+   Then directly check:
    - `package.json` for exact dependency versions
    - Config files (postcss, tailwind, tsconfig, next.config, etc.)
-   - Existing components for real patterns in use
-   - Test patterns (how existing tests are structured)
 
 4. **Create a feature branch**:
    ```bash
@@ -32,11 +35,7 @@ You are a senior frontend developer. You receive GitHub issues labeled `frontend
    - Include edge cases and error handling
    - Run the full test suite to make sure nothing is broken
 
-7. **Run checks locally**:
-   ```bash
-   # Find and run whatever test/lint commands the project uses
-   # Check package.json scripts, Makefile, etc.
-   ```
+7. **Run checks locally**: Dispatch the `test-runner` subagent via the Task tool. It will auto-detect the test command, run the suite, and return a parsed pass/fail summary. If anything fails, fix it before pushing — do NOT push code with failing tests.
 
 8. **Update the README**: If your changes affect how to run, build, or use the project, update the README.md accordingly. If no README exists, create one with:
    - Project name and brief description

@@ -55,6 +55,11 @@ ESCALATION_RECURRENCE_THRESHOLD = 3   # same pattern this many times → escalat
 ESCALATION_LOOKBACK_DAYS = 7
 ESCALATION_COOLDOWN_HOURS = 24        # do not re-escalate the same pattern within this window
 
+# Where to file the credential-expiry alert. Any project's GITHUB_TOKEN can
+# be used to write to this repo as long as the PAT has access to it.
+AUTOTEAM_REPO = "prasinus-automation/AutoTeam"
+CREDENTIAL_ALERT_TITLE = "AutoTeam credentials expired — run `claude /login` on the host"
+
 API_BASE = "https://api.github.com"
 
 
@@ -571,6 +576,149 @@ def escalate_to_claude(pattern_info: dict, escalations: dict, dry_run: bool) -> 
     save_escalation_state(escalations)
 
 
+# ─── Credential expiry alerting ──────────────────────────
+def check_credentials(projects: list[dict], dry_run: bool) -> None:
+    """Read each daemon's /health credential block. If any daemon reports
+    expired credentials, file a single GitHub issue in the AutoTeam repo so
+    the human gets a notification. Idempotent: only files the issue if one
+    isn't already open with the same title."""
+    expired_projects: list[tuple[str, dict]] = []
+    healthy_count = 0
+    for project in projects:
+        daemon = daemon_health(project["webhook_port"])
+        if daemon is None:
+            continue
+        creds = daemon.get("credentials") or {}
+        if creds.get("mode") == "api_key":
+            healthy_count += 1
+            continue
+        if creds.get("expired"):
+            expired_projects.append((project["name"], creds))
+        else:
+            healthy_count += 1
+
+    if not expired_projects:
+        log.info(f"Credentials healthy across {healthy_count} daemon(s)")
+        return
+
+    log.warning(f"CREDENTIAL EXPIRY: {len(expired_projects)} daemon(s) report expired credentials")
+    for name, creds in expired_projects:
+        log.warning(f"  {name}: {creds.get('reason') or 'expired'}")
+
+    if dry_run:
+        log.info("[DRY-RUN] Would file/refresh AutoTeam credential alert issue")
+        return
+
+    # Pick any project's token — we just need a PAT with access to the
+    # AutoTeam repo, and the org-wide PAT is shared across projects.
+    token = projects[0]["token"]
+
+    # Look for an already-open alert issue. We match by exact title to keep
+    # this dead simple.
+    status, items = gh_get(
+        f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues?state=open&per_page=50",
+        token,
+    )
+    existing = None
+    if isinstance(items, list):
+        for it in items:
+            if "pull_request" in it:
+                continue
+            if it.get("title") == CREDENTIAL_ALERT_TITLE:
+                existing = it
+                break
+
+    body_lines = [
+        "The hourly health check detected that one or more AutoTeam daemons are running with expired Claude credentials.",
+        "",
+        "**To fix:** on the host machine, run an interactive Claude Code session and execute `/login`. The daemons will pick up the new credentials automatically — no daemon restart needed (the directory mount stays in sync with the host file).",
+        "",
+        "## Affected daemons",
+        "",
+    ]
+    for name, creds in expired_projects:
+        reason = creds.get("reason") or f"expired at {creds.get('expires_at', 'unknown')}"
+        body_lines.append(f"- **{name}**: {reason}")
+    body_lines.append("")
+    body_lines.append(f"_Detected at {datetime.now(timezone.utc).isoformat()} by `health-check.py`._")
+    body_lines.append("")
+    body_lines.append("This issue will close itself automatically once credentials are refreshed and the next health-check run sees them as valid.")
+    body = "\n".join(body_lines)
+
+    if existing:
+        # Refresh the body so it always reflects the current detection time
+        # and the latest list of affected daemons. Don't spam comments —
+        # one issue, refreshed in place.
+        gh_request(
+            "PATCH",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues/{existing['number']}",
+            token,
+            {"body": body},
+        )
+        log.warning(f"Refreshed credential alert issue #{existing['number']} on {AUTOTEAM_REPO}")
+    else:
+        status, created = gh_request(
+            "POST",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues",
+            token,
+            {"title": CREDENTIAL_ALERT_TITLE, "body": body},
+        )
+        if isinstance(created, dict) and "number" in created:
+            log.warning(f"Filed credential alert issue #{created['number']} on {AUTOTEAM_REPO}: {created.get('html_url')}")
+        else:
+            log.error(f"Failed to file credential alert issue: status={status} resp={created}")
+
+
+def maybe_close_credential_alert(projects: list[dict], dry_run: bool) -> None:
+    """If credentials are healthy and there's an open alert issue, close it."""
+    # Only close if EVERY daemon we can reach reports healthy credentials.
+    any_expired = False
+    any_seen = False
+    for project in projects:
+        daemon = daemon_health(project["webhook_port"])
+        if daemon is None:
+            continue
+        creds = daemon.get("credentials") or {}
+        if creds.get("mode") == "none":
+            continue
+        any_seen = True
+        if creds.get("expired"):
+            any_expired = True
+            break
+    if any_expired or not any_seen:
+        return
+
+    token = projects[0]["token"]
+    status, items = gh_get(
+        f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues?state=open&per_page=50",
+        token,
+    )
+    if not isinstance(items, list):
+        return
+    for it in items:
+        if "pull_request" in it:
+            continue
+        if it.get("title") != CREDENTIAL_ALERT_TITLE:
+            continue
+        if dry_run:
+            log.info(f"[DRY-RUN] Would close credential alert issue #{it['number']}")
+            return
+        gh_request(
+            "POST",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues/{it['number']}/comments",
+            token,
+            {"body": "Credentials are healthy across all daemons again. Auto-closing."},
+        )
+        gh_request(
+            "PATCH",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues/{it['number']}",
+            token,
+            {"state": "closed", "state_reason": "completed"},
+        )
+        log.info(f"Closed credential alert issue #{it['number']}")
+        return
+
+
 # ─── Main ────────────────────────────────────────────────
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -583,6 +731,11 @@ def main() -> int:
     log.info("─── health-check run started ───")
     projects = discover_projects()
     log.info(f"Discovered {len(projects)} project(s)")
+
+    # ── Credential expiry check (cheap, runs first) ────
+    if projects:
+        check_credentials(projects, args.dry_run)
+        maybe_close_credential_alert(projects, args.dry_run)
 
     total_incidents = 0
     total_remediated = 0

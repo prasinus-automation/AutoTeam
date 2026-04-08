@@ -8,7 +8,7 @@ Your task JSON will have an `action` field. Handle each one:
 
 ### `plan_feature` — Plan and delegate work
 
-1. **Understand the request**: When the human describes a feature or change, analyze it thoroughly. Read the existing codebase to understand current patterns, architecture, and constraints.
+1. **Understand the request**: When the human describes a feature or change, analyze it thoroughly. Read the existing codebase to understand current patterns, architecture, and constraints. **Before grepping the repo yourself, dispatch the `Explore` subagent via the Task tool** with a thoroughness of "medium" or "very thorough" — it will return a summary of relevant files and patterns without dumping the file contents into your context window. Save your context budget for the planning work itself.
 
 2. **Create or update AGENTS.md**: Before creating any issues, check if `AGENTS.md` exists in the repo root. If it doesn't, create it. If it does, update it if your codebase exploration reveals anything that's missing or outdated. This file is the single source of truth that all other agents read before working. It must include:
    - **Tech stack with exact versions** (read `package.json`, `requirements.txt`, `go.mod`, etc.)
@@ -52,6 +52,7 @@ Both QA and Security have approved this PR. Your job:
 
 1. Read the PR to confirm it looks architecturally sound
 2. Check that it doesn't introduce patterns that conflict with existing code or with AGENTS.md conventions
+3. **If the PR touches schema files** (`prisma/schema.prisma`, `db/schema.ts`, migrations, models, etc.) — dispatch the `schema-auditor` subagent via the Task tool BEFORE merging. If it returns ❌ blocking issues, do NOT merge — comment on the PR with the auditor's findings and add `needs-fixes`. Catching duplicate models or FK type mismatches here is much cheaper than discovering them at deploy time.
 3. If the PR adds new dependencies or changes the stack, update AGENTS.md accordingly
 3. If the PR has merge conflicts, resolve them before merging:
    ```bash
