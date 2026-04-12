@@ -1404,7 +1404,28 @@ def poll_github():
                 if result:
                     log.info(f"Both approved: PR #{pr_number} — merging")
             elif last_changes_requested:
-                dispatch_needs_fixes(pr)
+                # Check if a dev fix was posted AFTER the last review that
+                # requested changes. If so, the fix is already applied and
+                # we should re-trigger reviewers instead of another fix cycle.
+                last_review_time = None
+                last_fix_time = None
+                for c in comments:
+                    body = c.get("body", "")
+                    header = body.split("\n")[0] if body else ""
+                    if ("QA Review" in header or "Security Review" in header) and "CHANGES REQUESTED" in header.upper():
+                        last_review_time = c.get("created_at", "")
+                    if body.startswith("## Fix iteration") or body.startswith("## Review feedback addressed"):
+                        last_fix_time = c.get("created_at", "")
+
+                if last_fix_time and last_review_time and last_fix_time > last_review_time:
+                    # Dev already fixed — re-trigger reviewers
+                    log.info(f"PR #{pr_number} — fix exists after last review, re-triggering reviewers")
+                    state.clear_handled(f"qa-{pr_number}")
+                    state.clear_handled(f"security-{pr_number}")
+                    dispatch_qa(pr)
+                    dispatch_security(pr)
+                else:
+                    dispatch_needs_fixes(pr)
             else:
                 # Dispatch whichever reviewers haven't run yet
                 # Clear handled state so dispatch_qa/dispatch_security can proceed
