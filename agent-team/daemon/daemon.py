@@ -201,13 +201,22 @@ def gh_get_review_comments(pr_number):
 
 
 def gh_get_review_feedback(pr_number):
-    """Bundle all review feedback (CHANGES_REQUESTED reviews + inline comments) for a dev."""
+    """Bundle all review feedback for a dev.
+
+    Collects from three sources:
+    1. Formal PR reviews with CHANGES_REQUESTED state
+    2. Inline PR review comments
+    3. Issue comments containing "CHANGES REQUESTED" from QA/Security agents
+       (agents share a token so they post as issue comments, not formal reviews)
+
+    Only returns feedback that is NEWER than the last dev fix comment, so devs
+    don't re-address already-fixed issues."""
     reviews = gh_get_pr_reviews(pr_number)
-    comments = gh_get_review_comments(pr_number)
+    pr_comments = gh_get_review_comments(pr_number)
 
     feedback = []
 
-    # Collect review-level feedback
+    # Collect formal review-level feedback
     for review in reviews:
         if review.get("state") == "CHANGES_REQUESTED":
             feedback.append({
@@ -217,7 +226,7 @@ def gh_get_review_feedback(pr_number):
             })
 
     # Collect inline comments
-    for comment in comments:
+    for comment in pr_comments:
         feedback.append({
             "type": "inline_comment",
             "reviewer": comment.get("user", {}).get("login", "unknown"),
@@ -225,6 +234,38 @@ def gh_get_review_feedback(pr_number):
             "line": comment.get("line") or comment.get("original_line"),
             "body": comment.get("body", ""),
         })
+
+    # Collect QA/Security agent issue comments with changes requested.
+    # Only include comments newer than the last dev fix comment.
+    try:
+        issue_comments = requests.get(
+            f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+            headers=HEADERS,
+            params={"per_page": 100},
+        ).json()
+        if isinstance(issue_comments, list):
+            # Find the timestamp of the last dev fix comment
+            last_fix_time = None
+            for c in issue_comments:
+                body = c.get("body", "")
+                if body.startswith("## Fix iteration") or body.startswith("## Review feedback addressed"):
+                    last_fix_time = c.get("created_at")
+
+            for c in issue_comments:
+                body = c.get("body", "")
+                created = c.get("created_at", "")
+                # Skip comments older than the last fix
+                if last_fix_time and created <= last_fix_time:
+                    continue
+                # Only include QA/Security review comments that request changes
+                if "CHANGES REQUESTED" in body and ("QA Review" in body or "Security Review" in body):
+                    feedback.append({
+                        "type": "review_comment",
+                        "reviewer": "qa" if "QA Review" in body else "security",
+                        "body": body,
+                    })
+    except Exception as e:
+        log.debug(f"Failed to fetch issue comments for PR #{pr_number}: {e}")
 
     return feedback
 
@@ -890,13 +931,25 @@ def dispatch_needs_fixes(pr):
                    f"Requesting human intervention — please review and guide the next steps.")
         return
 
+    # Fetch review feedback to pass to the dev
+    feedback = gh_get_review_feedback(number)
+
+    # If there's no new feedback since the last fix, don't waste an iteration.
+    # The dev already addressed everything — either reviewers haven't re-run yet,
+    # or the fix was accepted. Remove the label and let the next synchronize
+    # event trigger fresh reviews.
+    if not feedback:
+        log.info(f"PR #{number} — no new review feedback since last fix, skipping iteration {iterations}")
+        gh_remove_label(number, "needs-fixes")
+        with state.lock:
+            state.fix_iterations[number] = iterations - 1  # don't count this
+            state.pending_fix_prs.discard(number)
+        return
+
     log.info(f"Needs fixes: PR #{number} (iteration {iterations}) — spawning {dev_role}")
 
     # Remove needs-fixes label so it can be re-applied after next review
     gh_remove_label(number, "needs-fixes")
-
-    # Fetch review feedback to pass to the dev
-    feedback = gh_get_review_feedback(number)
 
     spawn_agent(dev_role, {
         "action": "fix_review_feedback",
