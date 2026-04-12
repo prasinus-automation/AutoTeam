@@ -1,4 +1,4 @@
-.PHONY: build up down logs tunnel-url status clean init-repo setup install uninstall
+.PHONY: build up down logs status clean init-repo setup install uninstall
 
 # ─── First time (does everything) ────────────────────
 setup:
@@ -26,8 +26,7 @@ up:
 	else \
 		docker compose up -d; \
 	fi
-	@echo "✓ Daemon + tunnel running"
-	@echo "  Run 'make tunnel-url' to get your webhook URL"
+	@echo "✓ Daemon running"
 	@echo "  Run 'make logs' to watch the daemon"
 
 down:
@@ -61,18 +60,9 @@ uninstall:
 	@sudo systemctl daemon-reload
 	@echo "✓ Systemd service removed"
 
-# ─── Tunnel ──────────────────────────────────────────
-tunnel-url:
-	@echo "Looking for tunnel URL..."
-	@docker compose logs tunnel 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1 || \
-		echo "Tunnel not ready yet — try again in a few seconds"
-
 # ─── Observe ─────────────────────────────────────────
 logs:
 	docker compose logs -f daemon
-
-logs-tunnel:
-	docker compose logs -f tunnel
 
 logs-all:
 	docker compose logs -f

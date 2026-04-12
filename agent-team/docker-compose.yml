@@ -53,22 +53,6 @@ services:
     networks:
       - agent-net
 
-  # ── Cloudflare tunnel (exposes webhook to GitHub) ───
-  # Free, no account needed for quick tunnels.
-  # Gives you a public https://xxx.trycloudflare.com URL.
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: ${COMPOSE_PROJECT_NAME:-agent-team}-tunnel
-    restart: unless-stopped
-    command: tunnel --no-autoupdate --url http://daemon:${WEBHOOK_PORT:-9876}
-    depends_on:
-      - daemon
-    networks:
-      - agent-net
-    # The tunnel URL will be printed in the logs:
-    #   docker compose logs tunnel
-    # Copy that URL into your GitHub webhook settings.
-
   # ── Agent images (build-only, spawned by daemon) ────
   agent-base:
     build:

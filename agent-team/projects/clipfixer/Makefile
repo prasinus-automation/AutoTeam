@@ -6,16 +6,14 @@ export
 
 COMPOSE := docker compose -f $(AGENT_TEAM_DIR)/docker-compose.yml -p $(COMPOSE_PROJECT_NAME) --env-file $(CURDIR)/.env
 
-.PHONY: up down logs status tunnel-url health build init-repo clean
 
 up:
 	$(COMPOSE) build daemon
-	$(COMPOSE) up -d daemon tunnel
+	$(COMPOSE) up -d daemon
 	@sleep 3
 	@echo ""
 	@echo "  $(COMPOSE_PROJECT_NAME) is running!"
 	@echo "  Repo: $(GITHUB_REPO)"
-	@$(MAKE) --no-print-directory tunnel-url
 
 down:
 	$(COMPOSE) down
@@ -26,8 +24,6 @@ logs:
 status:
 	@docker ps --filter "name=$(COMPOSE_PROJECT_NAME)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-tunnel-url:
-	@docker logs $(COMPOSE_PROJECT_NAME)-tunnel 2>&1 | grep -o 'https://.*trycloudflare.com' | tail -1
 
 health:
 	@curl -s http://localhost:$(WEBHOOK_PORT)/ | python3 -m json.tool

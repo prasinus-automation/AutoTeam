@@ -560,6 +560,12 @@ def dispatch_architect(issue):
 def dispatch_frontend_dev(issue):
     number = issue["number"]
     key = f"frontend-dev-{number}"
+
+    with state.lock:
+        already_queued = any(r == "frontend-dev" and i["number"] == number for r, i in state.dev_queue)
+        if already_queued:
+            return
+
     if state.already_handled(key):
         return
 
@@ -589,6 +595,12 @@ def dispatch_frontend_dev(issue):
 def dispatch_backend_dev(issue):
     number = issue["number"]
     key = f"backend-dev-{number}"
+
+    with state.lock:
+        already_queued = any(r == "backend-dev" and i["number"] == number for r, i in state.dev_queue)
+        if already_queued:
+            return
+
     if state.already_handled(key):
         return
 
@@ -615,11 +627,29 @@ def dispatch_backend_dev(issue):
 
 
 def drain_queue():
-    """Try to dispatch queued issues and pending PR fixes now that a slot may be free."""
+    """Try to dispatch pending PR fixes and queued issues now that a slot may be free.
+
+    PRIORITY: pending fixes always run before new issues. Finishing existing
+    PRs is more valuable than starting new ones — they unblock the architect
+    from merging downstream work, they have already absorbed review costs,
+    and old branches accumulate merge conflicts the longer they sit. Starting
+    new issues while fixes pile up creates compounding work-in-progress."""
     with state.lock:
         queue_copy = list(state.dev_queue)
         pending_copy = list(state.pending_fix_prs)
 
+    # Pending fixes first. dispatch_needs_fixes is idempotent — if devs are
+    # still saturated when we get here, it'll just re-park the PR.
+    for pr_number in pending_copy:
+        try:
+            r = requests.get(f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}", headers=HEADERS)
+            if r.status_code == 200:
+                dispatch_needs_fixes(r.json())
+        except Exception as e:
+            log.debug(f"drain pending fix #{pr_number}: {e}")
+
+    # Then new issues from the queue. If a pending fix grabbed the slot,
+    # these will all defer back into the queue, which is what we want.
     for role, issue in queue_copy:
         if role == "frontend-dev":
             dispatch_frontend_dev(issue)
@@ -630,17 +660,6 @@ def drain_queue():
             key = f"{role}-{issue['number']}"
             if key in state.processed:
                 state.dev_queue = [(r, i) for r, i in state.dev_queue if not (r == role and i["number"] == issue["number"])]
-
-    # Re-attempt deferred fix dispatches by re-fetching the PR and calling
-    # dispatch_needs_fixes again. dispatch_needs_fixes is idempotent and will
-    # re-park the PR if devs are still saturated.
-    for pr_number in pending_copy:
-        try:
-            r = requests.get(f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}", headers=HEADERS)
-            if r.status_code == 200:
-                dispatch_needs_fixes(r.json())
-        except Exception as e:
-            log.debug(f"drain pending fix #{pr_number}: {e}")
 
 
 def dispatch_dependents(pr):
@@ -1158,12 +1177,16 @@ def run_webhook_server():
 
 def poll_github():
     """Poll GitHub for work. Uses GitHub state as source of truth.
-    spawn_agent's duplicate check prevents double-spawning."""
+    spawn_agent's duplicate check prevents double-spawning.
 
-    # Issues ready to go
+    PRIORITY: open PRs awaiting fixes are dispatched BEFORE new issues.
+    Finishing existing PRs is more valuable than starting new ones — see
+    drain_queue() for the full rationale. This ordering also matters at
+    daemon startup, since the recovery scan goes through this same path."""
+
+    # Architect runs first — exempt from dev cap, quick, and unblocks merges
     for issue in gh_get_issues("architect"):
         number = issue["number"]
-        # spawn_agent checks for duplicates, so just try to spawn
         result = spawn_agent("architect", {
             "action": "plan_feature",
             "issue_number": number,
@@ -1176,6 +1199,16 @@ def poll_github():
             gh_remove_label(number, "architect")
             gh_add_label(number, "architect-in-progress")
 
+    # PRs labeled needs-fixes BEFORE new issues. dispatch_needs_fixes will
+    # park them in pending_fix_prs if devs are saturated, where drain_queue
+    # will pick them up first when a slot frees.
+    for pr in gh_get_prs("open"):
+        if pr.get("draft"):
+            continue
+        labels = {l["name"] for l in pr.get("labels", [])}
+        if "needs-fixes" in labels:
+            dispatch_needs_fixes(pr)
+
     for issue in gh_get_issues("frontend-dev"):
         dispatch_frontend_dev(issue)
     for issue in gh_get_issues("backend-dev"):
@@ -1184,12 +1217,17 @@ def poll_github():
     # Recover labeled issues that were handled but have no agent running and no PR.
     # This catches cases where an agent failed before swapping labels (e.g., rate limit
     # on first attempt, container crash before label change).
+    # Skip issues already queued or pending — they'll be dispatched when a slot frees.
     with state.lock:
         active_numbers = {v["number"] for v in state.active_containers.values()}
+        queued_numbers = {i["number"] for _, i in state.dev_queue}
+        pending_numbers = state.pending_fix_prs.copy()
     for label, dispatch_fn in [("frontend-dev", dispatch_frontend_dev), ("backend-dev", dispatch_backend_dev)]:
         for issue in gh_get_issues(label):
             number = issue["number"]
             key = f"{label}-{number}"
+            if number in queued_numbers:
+                continue
             if key in state.processed and number not in active_numbers and not gh_issue_has_open_pr(number):
                 log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
                 state.clear_handled(key)
@@ -1206,10 +1244,14 @@ def poll_github():
         gh_add_label(issue["number"], "architect")
 
     # Stuck dev-in-progress issues (no agent running, no open PR)
+    # Skip issues already queued — they're waiting for a dev slot, not stuck.
     with state.lock:
         active_numbers = {v["number"] for v in state.active_containers.values()}
+        queued_numbers = {i["number"] for _, i in state.dev_queue}
     for issue in gh_get_issues("dev-in-progress"):
         if issue.get("state") == "closed" or issue["number"] in active_numbers:
+            continue
+        if issue["number"] in queued_numbers:
             continue
         if gh_issue_has_open_pr(issue["number"]):
             continue
