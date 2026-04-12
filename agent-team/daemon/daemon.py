@@ -691,16 +691,16 @@ def drain_queue():
 
     # Then new issues from the queue. If a pending fix grabbed the slot,
     # these will all defer back into the queue, which is what we want.
+    # Remove from queue BEFORE dispatching — dispatch_frontend_dev/backend_dev
+    # has an already_queued early-return that would block it otherwise.
     for role, issue in queue_copy:
+        with state.lock:
+            state.dev_queue = [(r, i) for r, i in state.dev_queue if not (r == role and i["number"] == issue["number"])]
+            state.processed.discard(f"{role}-{issue['number']}")
         if role == "frontend-dev":
             dispatch_frontend_dev(issue)
         elif role == "backend-dev":
             dispatch_backend_dev(issue)
-        # If it dispatched successfully, remove from queue
-        with state.lock:
-            key = f"{role}-{issue['number']}"
-            if key in state.processed:
-                state.dev_queue = [(r, i) for r, i in state.dev_queue if not (r == role and i["number"] == issue["number"])]
 
 
 def dispatch_dependents(pr):
