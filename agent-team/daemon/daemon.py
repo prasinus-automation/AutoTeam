@@ -1218,15 +1218,15 @@ def poll_github():
     # This catches cases where an agent failed before swapping labels (e.g., rate limit
     # on first attempt, container crash before label change).
     # Skip issues already queued or pending — they'll be dispatched when a slot frees.
-    with state.lock:
-        active_numbers = {v["number"] for v in state.active_containers.values()}
-        queued_numbers = {i["number"] for _, i in state.dev_queue}
-        pending_numbers = state.pending_fix_prs.copy()
+    # Re-read state fresh since earlier dispatch calls may have mutated it.
     for label, dispatch_fn in [("frontend-dev", dispatch_frontend_dev), ("backend-dev", dispatch_backend_dev)]:
         for issue in gh_get_issues(label):
             number = issue["number"]
             key = f"{label}-{number}"
-            if number in queued_numbers:
+            with state.lock:
+                in_queue = any(r == label and i["number"] == number for r, i in state.dev_queue)
+                active_numbers = {v["number"] for v in state.active_containers.values()}
+            if in_queue:
                 continue
             if key in state.processed and number not in active_numbers and not gh_issue_has_open_pr(number):
                 log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
@@ -1244,23 +1244,38 @@ def poll_github():
         gh_add_label(issue["number"], "architect")
 
     # Stuck dev-in-progress issues (no agent running, no open PR)
-    # Skip issues already queued — they're waiting for a dev slot, not stuck.
+    # Re-read queued/pending state fresh since earlier dispatch calls may have
+    # added entries since the last snapshot.
     with state.lock:
         active_numbers = {v["number"] for v in state.active_containers.values()}
         queued_numbers = {i["number"] for _, i in state.dev_queue}
+        pending_numbers = state.pending_fix_prs.copy()
+        dev_count = sum(
+            1 for v in state.active_containers.values()
+            if v.get("role") in ("frontend-dev", "backend-dev")
+        )
     for issue in gh_get_issues("dev-in-progress"):
         if issue.get("state") == "closed" or issue["number"] in active_numbers:
             continue
-        if issue["number"] in queued_numbers:
+        if issue["number"] in queued_numbers or issue["number"] in pending_numbers:
             continue
         if gh_issue_has_open_pr(issue["number"]):
             continue
+        # If devs are saturated, queue the issue directly instead of re-labeling
+        # and triggering another dispatch cycle that will just defer again.
         body = issue.get("body", "") or ""
         other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
         if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
             dev_label = "backend-dev"
         else:
             dev_label = "frontend-dev"
+        if dev_count >= MAX_TOTAL_AGENTS:
+            with state.lock:
+                already_queued = any(r == dev_label and i["number"] == issue["number"] for r, i in state.dev_queue)
+                if not already_queued:
+                    state.dev_queue.append((dev_label, issue))
+                    log.info(f"Queued stuck #{issue['number']} — devs saturated ({dev_label}, {len(state.dev_queue)} in queue)")
+            continue
         log.info(f"Recovering stuck #{issue['number']} → {dev_label}")
         gh_remove_label(issue["number"], "dev-in-progress")
         gh_add_label(issue["number"], dev_label)
