@@ -1,6 +1,7 @@
 .env
 *.log
 /tmp/
+/logs/
 __pycache__/
 *.pyc
 .DS_Store

@@ -48,6 +48,8 @@ MAX_BACKEND_AGENTS = int(os.environ.get("MAX_BACKEND_AGENTS", "2"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 MAX_TRANSIENT_RETRIES = int(os.environ.get("MAX_TRANSIENT_RETRIES", "5"))
 TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # seconds
+TRANSIENT_BACKOFF_MAX = int(os.environ.get("TRANSIENT_BACKOFF_MAX", "1800"))  # 30 min cap
+AUTH_ERROR_BACKOFF_BASE = int(os.environ.get("AUTH_ERROR_BACKOFF_BASE", "300"))  # 5 min — auth blips usually need more time
 LOG_DIR = os.environ.get("LOG_DIR", "/logs")
 REPO_CACHE_VOLUME = os.environ.get("REPO_CACHE_VOLUME", "agent-team_repo-cache")
 PROJECT_NAME = os.environ.get("COMPOSE_PROJECT_NAME", "agent-team")
@@ -496,14 +498,17 @@ def monitor_container(container_id):
         else:
             log.warning(f"✗ {info['name']} exited ({exit_code})")
 
-            # Check if it's a transient error (rate limit, auth expiry)
+            # Classify exit reason from logs
+            is_auth_error = False
             is_transient = False
             try:
-                logs_text = container.logs(tail=50).decode("utf-8", errors="replace")
-                is_transient = any(s in logs_text.lower() for s in [
+                logs_text = container.logs(tail=50).decode("utf-8", errors="replace").lower()
+                is_auth_error = any(s in logs_text for s in [
+                    "authentication_error", "401", "invalid authentication",
+                ])
+                is_transient = is_auth_error or any(s in logs_text for s in [
                     "rate limit", "usage limit", "too many requests",
                     "429", "overloaded", "capacity",
-                    "authentication_error", "401", "invalid authentication",
                 ])
             except Exception:
                 pass
@@ -514,18 +519,37 @@ def monitor_container(container_id):
                     retries = state.retry_counts.get(retry_key, 0) + 1
                     state.retry_counts[retry_key] = retries
 
-                if retries > MAX_TRANSIENT_RETRIES:
-                    log.warning(f"✗ {info['name']} exceeded max transient retries ({MAX_TRANSIENT_RETRIES})")
+                # Auth errors are Anthropic-side transient issues (brief token
+                # revocations, upstream 401s). Retry indefinitely with a longer
+                # initial backoff — capped at TRANSIENT_BACKOFF_MAX. Non-auth
+                # transients (real rate limits) still give up after MAX_TRANSIENT_RETRIES.
+                if is_auth_error:
+                    backoff = min(
+                        AUTH_ERROR_BACKOFF_BASE * (2 ** (retries - 1)),
+                        TRANSIENT_BACKOFF_MAX,
+                    )
+                    give_up = False
+                else:
+                    backoff = min(
+                        TRANSIENT_BACKOFF_BASE * (2 ** (retries - 1)),
+                        TRANSIENT_BACKOFF_MAX,
+                    )
+                    give_up = retries > MAX_TRANSIENT_RETRIES
+
+                backoff_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                with state.lock:
+                    state.retry_backoff_until[retry_key] = backoff_until
+
+                if give_up:
+                    # Still set backoff so recovery poll doesn't tight-loop.
+                    # A long cooldown gives the human time to intervene without
+                    # the daemon spamming GitHub with retries in the meantime.
+                    log.warning(f"✗ {info['name']} exceeded max transient retries ({MAX_TRANSIENT_RETRIES}) — cooldown {backoff}s")
                     gh_comment(info["number"],
                                f"⚠️ Agent `{info['role']}` failed after {MAX_TRANSIENT_RETRIES} retries "
-                               f"(rate limit / transient error). Requires manual intervention.")
+                               f"(rate limit / transient error). Requires manual intervention. "
+                               f"Daemon will cool down for {backoff//60}m before trying again.")
                 else:
-                    # Exponential backoff: 60s, 120s, 240s, 480s, 960s
-                    backoff = TRANSIENT_BACKOFF_BASE * (2 ** (retries - 1))
-                    backoff_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
-                    with state.lock:
-                        state.retry_backoff_until[retry_key] = backoff_until
-
                     state.clear_handled(f"{info['role']}-{info['number']}")
                     if info["role"] in ("frontend-dev", "backend-dev"):
                         gh_remove_label(info["number"], "dev-in-progress")
@@ -534,11 +558,12 @@ def monitor_container(container_id):
                         gh_remove_label(info["number"], "architect-in-progress")
                         gh_add_label(info["number"], "architect")
 
+                    kind = "auth" if is_auth_error else "transient"
                     if retries == 1:
                         gh_comment(info["number"],
-                                   f"⏳ Agent `{info['role']}` hit a transient error. "
-                                   f"Will retry in {backoff}s (attempt {retries}/{MAX_TRANSIENT_RETRIES}).")
-                    log.info(f"↻ {info['name']} transient error — retry {retries}/{MAX_TRANSIENT_RETRIES} "
+                                   f"⏳ Agent `{info['role']}` hit a {kind} error. "
+                                   f"Will retry in {backoff}s.")
+                    log.info(f"↻ {info['name']} {kind} error — retry {retries} "
                              f"in {backoff}s")
             else:
                 gh_comment(info["number"],
@@ -1271,6 +1296,8 @@ def poll_github():
     # This catches cases where an agent failed before swapping labels (e.g., rate limit
     # on first attempt, container crash before label change).
     # Skip issues already queued or pending — they'll be dispatched when a slot frees.
+    # Skip issues with an active retry backoff — otherwise we tight-loop dispatching
+    # agents that fail fast on 401/rate-limit, each failure re-triggering recovery.
     # Re-read state fresh since earlier dispatch calls may have mutated it.
     for label, dispatch_fn in [("frontend-dev", dispatch_frontend_dev), ("backend-dev", dispatch_backend_dev)]:
         for issue in gh_get_issues(label):
@@ -1279,7 +1306,10 @@ def poll_github():
             with state.lock:
                 in_queue = any(r == label and i["number"] == number for r, i in state.dev_queue)
                 active_numbers = {v["number"] for v in state.active_containers.values()}
+                backoff_until = state.retry_backoff_until.get(key)
             if in_queue:
+                continue
+            if backoff_until and datetime.now(timezone.utc) < backoff_until:
                 continue
             if key in state.processed and number not in active_numbers and not gh_issue_has_open_pr(number):
                 log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
