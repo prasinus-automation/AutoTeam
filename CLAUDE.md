@@ -41,7 +41,7 @@ make install/uninstall # Manage systemd service
 
 **Agent containers**: All built on `agent-base` (Dockerfile.base: node:20 + git + gh CLI + Claude Code CLI). Each role has its own Dockerfile layer and system prompt (`prompts/*.md`). The shared entrypoint (`scripts/agent-entrypoint.sh`) handles git auth, repo setup (worktrees for dev/qa/security, copies for architect), and invokes `claude --print`.
 
-**Branch conventions**: Frontend devs create `frontend/<issue>-<slug>` branches, backend devs create `backend/<issue>-<slug>`. The daemon uses this prefix to determine which dev type to re-spawn for fixes.
+**Branch conventions**: Frontend devs create `frontend/<issue>-<slug>` branches, backend devs create `backend/<issue>-<slug>`, fullstack devs create `fullstack/<issue>-<slug>`. The daemon uses this prefix to determine which dev type to re-spawn for fixes.
 
 **State management**: The daemon tracks processed events in-memory (`DaemonState.processed` set), monitors containers in background threads, and tracks fix iteration counts per PR. Agent logs are saved to the `agent-logs` volume. The repo cache volume is refreshed every 5 minutes.
 
@@ -57,14 +57,16 @@ make install/uninstall # Manage systemd service
 
 ## GitHub Labels
 
-Pipeline labels: `architect`, `architect-in-progress`, `frontend-dev`, `backend-dev`, `dev-in-progress`, `needs-fixes`
+Pipeline labels: `architect`, `architect-in-progress`, `frontend-dev`, `backend-dev`, `fullstack-dev`, `dev-in-progress`, `needs-fixes`
 
 ## Agents
 
 | Agent | Trigger | Branch prefix | Purpose |
 |-------|---------|--------------|---------|
-| Architect | `architect` label on issue | — | Plans work, creates sub-issues, merges approved PRs |
+| Architect | `architect` label on issue | — | Plans work, creates sub-issues |
+| Architect-Merger | both QA + Security approved | — | Final sanity check, merges approved PRs |
 | Frontend Dev | `frontend-dev` label on issue | `frontend/` | Frontend implementation |
 | Backend Dev | `backend-dev` label on issue | `backend/` | Backend implementation |
-| QA | PR opened/updated | — | Functional review, test execution |
-| Security | PR opened/updated | — | Security review, SAST scans |
+| Fullstack Dev | `fullstack-dev` label on issue | `fullstack/` | Cross-cutting features in projects without a clean FE/BE split |
+| QA | PR opened/updated | — | Functional review, test execution (runs first) |
+| Security | After QA approves | — | Security review, SAST scans (runs after QA) |

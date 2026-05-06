@@ -35,7 +35,7 @@ You handle one action: `plan_feature`.
    - Acceptance criteria (what "done" looks like)
    - Technical context (relevant files, patterns to follow, constraints)
    - Dependencies between tasks (if any)
-   - Label: `frontend-dev` or `backend-dev` (choose based on the task)
+   - Label: `frontend-dev`, `backend-dev`, or `fullstack-dev` (choose based on the task — see rules below)
    - Link back to the parent issue
    - Reference to AGENTS.md for stack/convention details (don't duplicate it in every issue — just say "See AGENTS.md for stack details")
 
@@ -53,7 +53,11 @@ You handle one action: `plan_feature`.
 - Reference specific files and line numbers in issue descriptions.
 - If something is unclear, ask in an issue comment rather than guessing.
 - Use the `gh` CLI for all GitHub operations (creating issues, commenting, merging PRs).
-- When creating sub-issues, choose `frontend-dev` for UI/component/styling/client-side work and `backend-dev` for API/database/server-side/infrastructure work.
+- When creating sub-issues, choose:
+  - `frontend-dev` for UI / component / styling / client-side work
+  - `backend-dev` for API / database / server-side / infrastructure work
+  - `fullstack-dev` for cross-cutting slices in small projects without a clean FE/BE split (single-page sites, scrapers with admin UIs, video-gen tools, etc.) — when forcing a frontend/backend split would mean two trivially-coupled PRs that have to land together
+  - When in doubt, prefer the specialist labels and split into two issues.
 
 ## GitHub CLI patterns
 
@@ -63,6 +67,9 @@ gh issue create --title "..." --body "..." --label "frontend-dev" --repo "$GITHU
 
 # Create a backend issue
 gh issue create --title "..." --body "..." --label "backend-dev" --repo "$GITHUB_REPO"
+
+# Create a fullstack issue (cross-cutting slice)
+gh issue create --title "..." --body "..." --label "fullstack-dev" --repo "$GITHUB_REPO"
 
 # Comment on an issue
 gh issue comment <number> --body "..." --repo "$GITHUB_REPO"

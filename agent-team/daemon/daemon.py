@@ -45,6 +45,7 @@ MODE = os.environ.get("MODE", "webhook")  # "webhook" or "poll"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 MAX_FRONTEND_AGENTS = int(os.environ.get("MAX_FRONTEND_AGENTS", "2"))
 MAX_BACKEND_AGENTS = int(os.environ.get("MAX_BACKEND_AGENTS", "2"))
+MAX_FULLSTACK_AGENTS = int(os.environ.get("MAX_FULLSTACK_AGENTS", "1"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 MAX_TRANSIENT_RETRIES = int(os.environ.get("MAX_TRANSIENT_RETRIES", "5"))
 TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # seconds
@@ -63,9 +64,15 @@ RESOURCE_PROFILES = {
     "architect-merger":  {"mem_limit": "4g", "cpus": 2.0},
     "frontend-dev":      {"mem_limit": "6g", "cpus": 3.0},
     "backend-dev":       {"mem_limit": "6g", "cpus": 3.0},
+    "fullstack-dev":     {"mem_limit": "6g", "cpus": 3.0},
     "qa":                {"mem_limit": "6g", "cpus": 3.0},
     "security":          {"mem_limit": "6g", "cpus": 3.0},
 }
+
+# Roles that count against MAX_TOTAL_AGENTS and per-role caps. Centralizing
+# this tuple means adding a new dev role is a one-line change here plus the
+# matching dispatch_<role>_dev / state counter wiring.
+DEV_ROLES = ("frontend-dev", "backend-dev", "fullstack-dev")
 
 # ─── Logging ─────────────────────────────────────────────
 
@@ -305,6 +312,7 @@ class DaemonState:
         self.active_containers = {}
         self.frontend_dev_count = 0
         self.backend_dev_count = 0
+        self.fullstack_dev_count = 0
         self.fix_iterations = {}  # pr_number -> iteration count
         self.retry_counts = {}  # "role-number" -> transient retry count
         self.retry_backoff_until = {}  # "role-number" -> datetime to wait until
@@ -336,6 +344,27 @@ state = DaemonState()
 docker_client = docker.from_env()
 
 
+def _adjust_dev_count(role, delta):
+    """Bump the per-role dev counter by delta. Caller must hold state.lock."""
+    if role == "frontend-dev":
+        state.frontend_dev_count += delta
+    elif role == "backend-dev":
+        state.backend_dev_count += delta
+    elif role == "fullstack-dev":
+        state.fullstack_dev_count += delta
+
+
+def _dev_role_at_capacity(role):
+    """Return True if the per-role cap for `role` is full. Caller must hold lock."""
+    if role == "frontend-dev":
+        return state.frontend_dev_count >= MAX_FRONTEND_AGENTS
+    if role == "backend-dev":
+        return state.backend_dev_count >= MAX_BACKEND_AGENTS
+    if role == "fullstack-dev":
+        return state.fullstack_dev_count >= MAX_FULLSTACK_AGENTS
+    return False
+
+
 # ─── Container Management ────────────────────────────────
 
 def spawn_agent(role, task_context, issue_or_pr_number):
@@ -359,7 +388,7 @@ def spawn_agent(role, task_context, issue_or_pr_number):
         if role not in ("qa", "security", "architect", "architect-merger"):
             dev_count = sum(
                 1 for v in state.active_containers.values()
-                if v.get("role") in ("frontend-dev", "backend-dev")
+                if v.get("role") in DEV_ROLES
             )
             if dev_count >= MAX_TOTAL_AGENTS:
                 log.info(f"Max dev agents ({MAX_TOTAL_AGENTS}) reached — deferring {role} for #{issue_or_pr_number}")
@@ -406,10 +435,7 @@ def spawn_agent(role, task_context, issue_or_pr_number):
 
         # Increment dev count before spawning to prevent race conditions
         with state.lock:
-            if role == "frontend-dev":
-                state.frontend_dev_count += 1
-            elif role == "backend-dev":
-                state.backend_dev_count += 1
+            _adjust_dev_count(role, +1)
 
         try:
             container = docker_client.containers.run(
@@ -425,12 +451,8 @@ def spawn_agent(role, task_context, issue_or_pr_number):
                 network_mode="host",
             )
         except Exception:
-            # Roll back count if container failed to start
             with state.lock:
-                if role == "frontend-dev":
-                    state.frontend_dev_count -= 1
-                elif role == "backend-dev":
-                    state.backend_dev_count -= 1
+                _adjust_dev_count(role, -1)
             raise
 
         with state.lock:
@@ -488,14 +510,11 @@ def monitor_container(container_id):
     except Exception as e:
         log.error(f"Monitor error for {info.get('name', container_id)}: {e}", exc_info=True)
     finally:
-        is_dev = info["role"] in ("frontend-dev", "backend-dev")
+        is_dev = info["role"] in DEV_ROLES
         with state.lock:
             popped = state.active_containers.pop(container_id, None)
             if popped is not None:
-                if info["role"] == "frontend-dev":
-                    state.frontend_dev_count -= 1
-                elif info["role"] == "backend-dev":
-                    state.backend_dev_count -= 1
+                _adjust_dev_count(info["role"], -1)
         if is_dev:
             drain_queue()
 
@@ -675,7 +694,7 @@ def _handle_agent_failure(info, container, exit_code):
         return
 
     state.clear_handled(f"{info['role']}-{info['number']}")
-    if info["role"] in ("frontend-dev", "backend-dev"):
+    if info["role"] in DEV_ROLES:
         gh_remove_label(info["number"], "dev-in-progress")
         gh_add_label(info["number"], info["role"])
     elif info["role"] == "architect":
@@ -713,12 +732,15 @@ def dispatch_architect(issue):
     gh_add_label(number, "architect-in-progress")
 
 
-def dispatch_frontend_dev(issue):
+def _dispatch_dev(role, issue):
+    """Generic dev dispatcher used by frontend / backend / fullstack roles.
+    Queues if at per-role capacity; otherwise removes the role label, adds
+    dev-in-progress, and spawns the agent."""
     number = issue["number"]
-    key = f"frontend-dev-{number}"
+    key = f"{role}-{number}"
 
     with state.lock:
-        already_queued = any(r == "frontend-dev" and i["number"] == number for r, i in state.dev_queue)
+        already_queued = any(r == role and i["number"] == number for r, i in state.dev_queue)
         if already_queued:
             return
 
@@ -726,60 +748,37 @@ def dispatch_frontend_dev(issue):
         return
 
     with state.lock:
-        if state.frontend_dev_count >= MAX_FRONTEND_AGENTS:
-            # Queue it — will be picked up when a slot frees
-            already_queued = any(r == "frontend-dev" and i["number"] == number for r, i in state.dev_queue)
+        if _dev_role_at_capacity(role):
+            already_queued = any(r == role and i["number"] == number for r, i in state.dev_queue)
             if not already_queued:
-                state.dev_queue.append(("frontend-dev", issue))
-                log.info(f"Queued: #{number} — {issue['title']} (frontend-dev, {len(state.dev_queue)} in queue)")
+                state.dev_queue.append((role, issue))
+                log.info(f"Queued: #{number} — {issue['title']} ({role}, {len(state.dev_queue)} in queue)")
             state.processed.discard(key)
             return
 
-    log.info(f"Frontend dev issue: #{number} — {issue['title']}")
-    gh_remove_label(number, "frontend-dev")
+    log.info(f"{role} issue: #{number} — {issue['title']}")
+    gh_remove_label(number, role)
     gh_add_label(number, "dev-in-progress")
 
-    spawn_agent("frontend-dev", {
+    spawn_agent(role, {
         "action": "implement_issue",
         "issue_number": number,
         "issue_title": issue["title"],
         "issue_body": issue.get("body", ""),
         "issue_url": issue.get("html_url", ""),
     }, number)
+
+
+def dispatch_frontend_dev(issue):
+    _dispatch_dev("frontend-dev", issue)
 
 
 def dispatch_backend_dev(issue):
-    number = issue["number"]
-    key = f"backend-dev-{number}"
+    _dispatch_dev("backend-dev", issue)
 
-    with state.lock:
-        already_queued = any(r == "backend-dev" and i["number"] == number for r, i in state.dev_queue)
-        if already_queued:
-            return
 
-    if state.already_handled(key):
-        return
-
-    with state.lock:
-        if state.backend_dev_count >= MAX_BACKEND_AGENTS:
-            already_queued = any(r == "backend-dev" and i["number"] == number for r, i in state.dev_queue)
-            if not already_queued:
-                state.dev_queue.append(("backend-dev", issue))
-                log.info(f"Queued: #{number} — {issue['title']} (backend-dev, {len(state.dev_queue)} in queue)")
-            state.processed.discard(key)
-            return
-
-    log.info(f"Backend dev issue: #{number} — {issue['title']}")
-    gh_remove_label(number, "backend-dev")
-    gh_add_label(number, "dev-in-progress")
-
-    spawn_agent("backend-dev", {
-        "action": "implement_issue",
-        "issue_number": number,
-        "issue_title": issue["title"],
-        "issue_body": issue.get("body", ""),
-        "issue_url": issue.get("html_url", ""),
-    }, number)
+def dispatch_fullstack_dev(issue):
+    _dispatch_dev("fullstack-dev", issue)
 
 
 def drain_queue():
@@ -806,16 +805,14 @@ def drain_queue():
 
     # Then new issues from the queue. If a pending fix grabbed the slot,
     # these will all defer back into the queue, which is what we want.
-    # Remove from queue BEFORE dispatching — dispatch_frontend_dev/backend_dev
-    # has an already_queued early-return that would block it otherwise.
+    # Remove from queue BEFORE dispatching — _dispatch_dev has an
+    # already_queued early-return that would block it otherwise.
     for role, issue in queue_copy:
         with state.lock:
             state.dev_queue = [(r, i) for r, i in state.dev_queue if not (r == role and i["number"] == issue["number"])]
             state.processed.discard(f"{role}-{issue['number']}")
-        if role == "frontend-dev":
-            dispatch_frontend_dev(issue)
-        elif role == "backend-dev":
-            dispatch_backend_dev(issue)
+        if role in DEV_ROLES:
+            _dispatch_dev(role, issue)
 
 
 def dispatch_dependents(pr):
@@ -870,12 +867,11 @@ def dispatch_dependents(pr):
 
             # Trigger the appropriate dev agent
             issue_number = issue["number"]
-            if "frontend-dev" in labels:
-                log.info(f"Unblocked: #{issue_number} — dispatching frontend-dev")
-                dispatch_frontend_dev(issue)
-            elif "backend-dev" in labels:
-                log.info(f"Unblocked: #{issue_number} — dispatching backend-dev")
-                dispatch_backend_dev(issue)
+            for dev_role in DEV_ROLES:
+                if dev_role in labels:
+                    log.info(f"Unblocked: #{issue_number} — dispatching {dev_role}")
+                    _dispatch_dev(dev_role, issue)
+                    break
             else:
                 log.info(f"Unblocked: #{issue_number} — no dev label, skipping")
 
@@ -992,8 +988,10 @@ def dispatch_needs_fixes(pr):
         dev_role = "frontend-dev"
     elif branch.startswith("backend/"):
         dev_role = "backend-dev"
+    elif branch.startswith("fullstack/"):
+        dev_role = "fullstack-dev"
     else:
-        log.warning(f"PR #{number} branch '{branch}' has no frontend/ or backend/ prefix — skipping")
+        log.warning(f"PR #{number} branch '{branch}' has no frontend/, backend/, or fullstack/ prefix — skipping")
         return
 
     # If the latest reviews are both approvals, the fix is already applied — skip
@@ -1010,7 +1008,7 @@ def dispatch_needs_fixes(pr):
     with state.lock:
         dev_count = sum(
             1 for v in state.active_containers.values()
-            if v.get("role") in ("frontend-dev", "backend-dev")
+            if v.get("role") in DEV_ROLES
         )
         if dev_count >= MAX_TOTAL_AGENTS:
             if number not in state.pending_fix_prs:
@@ -1278,6 +1276,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "active_agents": active,
             "frontend_dev_slots": f"{state.frontend_dev_count}/{MAX_FRONTEND_AGENTS}",
             "backend_dev_slots": f"{state.backend_dev_count}/{MAX_BACKEND_AGENTS}",
+            "fullstack_dev_slots": f"{state.fullstack_dev_count}/{MAX_FULLSTACK_AGENTS}",
             "dev_queue_length": queue_len,
             "pending_fix_prs": pending_fixes,
             "max_total_agents": MAX_TOTAL_AGENTS,
@@ -1306,10 +1305,8 @@ def handle_webhook_event(event, payload):
 
         if label_name == "architect":
             dispatch_architect(issue)
-        elif label_name == "frontend-dev":
-            dispatch_frontend_dev(issue)
-        elif label_name == "backend-dev":
-            dispatch_backend_dev(issue)
+        elif label_name in DEV_ROLES:
+            _dispatch_dev(label_name, issue)
 
     # ── PR merged → unblock dependent issues ───────────
     elif event == "pull_request" and action == "closed":
@@ -1460,10 +1457,9 @@ def poll_github():
         if "needs-fixes" in labels:
             dispatch_needs_fixes(pr)
 
-    for issue in gh_get_issues("frontend-dev"):
-        dispatch_frontend_dev(issue)
-    for issue in gh_get_issues("backend-dev"):
-        dispatch_backend_dev(issue)
+    for label in DEV_ROLES:
+        for issue in gh_get_issues(label):
+            _dispatch_dev(label, issue)
 
     # Recover labeled issues that were handled but have no agent running and no PR.
     # This catches cases where an agent failed before swapping labels (e.g., rate limit
@@ -1472,7 +1468,7 @@ def poll_github():
     # Skip issues with an active retry backoff — otherwise we tight-loop dispatching
     # agents that fail fast on 401/rate-limit, each failure re-triggering recovery.
     # Re-read state fresh since earlier dispatch calls may have mutated it.
-    for label, dispatch_fn in [("frontend-dev", dispatch_frontend_dev), ("backend-dev", dispatch_backend_dev)]:
+    for label in DEV_ROLES:
         for issue in gh_get_issues(label):
             number = issue["number"]
             key = f"{label}-{number}"
@@ -1487,7 +1483,7 @@ def poll_github():
             if key in state.processed and number not in active_numbers and not gh_issue_has_open_pr(number):
                 log.info(f"Recovering stuck #{number} — clearing handled state for {label}")
                 state.clear_handled(key)
-                dispatch_fn(issue)
+                _dispatch_dev(label, issue)
 
     # Stuck architect-in-progress issues (no agent running)
     with state.lock:
@@ -1508,7 +1504,7 @@ def poll_github():
         pending_numbers = state.pending_fix_prs.copy()
         dev_count = sum(
             1 for v in state.active_containers.values()
-            if v.get("role") in ("frontend-dev", "backend-dev")
+            if v.get("role") in DEV_ROLES
         )
     for issue in gh_get_issues("dev-in-progress"):
         if issue.get("state") == "closed" or issue["number"] in active_numbers:
@@ -1521,7 +1517,10 @@ def poll_github():
         # and triggering another dispatch cycle that will just defer again.
         body = issue.get("body", "") or ""
         other_labels = [l["name"] for l in issue.get("labels", []) if l["name"] != "dev-in-progress"]
-        if "backend" in " ".join(other_labels).lower() or "backend" in body.lower():
+        labels_text = " ".join(other_labels).lower()
+        if "fullstack" in labels_text or "fullstack" in body.lower():
+            dev_label = "fullstack-dev"
+        elif "backend" in labels_text or "backend" in body.lower():
             dev_label = "backend-dev"
         else:
             dev_label = "frontend-dev"
@@ -1647,10 +1646,12 @@ def repo_cache_loop():
                 with state.lock:
                     for cid, info in ghosts:
                         state.active_containers.pop(cid, None)
-                        if info.get("role") == "frontend-dev":
-                            state.frontend_dev_count = max(0, state.frontend_dev_count - 1)
-                        elif info.get("role") == "backend-dev":
-                            state.backend_dev_count = max(0, state.backend_dev_count - 1)
+                        _adjust_dev_count(info.get("role"), -1)
+                        # Counters are non-negative — recovery handles drift,
+                        # but clamp to zero so a bug here can't go negative.
+                        state.frontend_dev_count = max(0, state.frontend_dev_count)
+                        state.backend_dev_count = max(0, state.backend_dev_count)
+                        state.fullstack_dev_count = max(0, state.fullstack_dev_count)
                 drain_queue()
         except Exception as e:
             log.debug(f"Ghost reconcile: {e}")
@@ -1667,7 +1668,8 @@ def status_line():
     if active:
         log.info(f"Active: {', '.join(active)} | "
                  f"Frontend: {state.frontend_dev_count}/{MAX_FRONTEND_AGENTS} | "
-                 f"Backend: {state.backend_dev_count}/{MAX_BACKEND_AGENTS}")
+                 f"Backend: {state.backend_dev_count}/{MAX_BACKEND_AGENTS} | "
+                 f"Fullstack: {state.fullstack_dev_count}/{MAX_FULLSTACK_AGENTS}")
     else:
         log.info(f"Idle — watching {GITHUB_REPO}")
 
@@ -1688,6 +1690,7 @@ def main():
     log.info(f"  Repo: {GITHUB_REPO}")
     log.info(f"  Frontend devs: {MAX_FRONTEND_AGENTS}")
     log.info(f"  Backend devs: {MAX_BACKEND_AGENTS}")
+    log.info(f"  Fullstack devs: {MAX_FULLSTACK_AGENTS}")
     log.info(f"  Max fix iterations: {MAX_FIX_ITERATIONS}")
     log.info("═══════════════════════════════════════")
 

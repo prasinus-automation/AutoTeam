@@ -14,6 +14,7 @@ build:
 	docker build -t agent-architect-merger:latest -f images/Dockerfile.architect-merger .
 	docker build -t agent-frontend-dev:latest -f images/Dockerfile.frontend-dev .
 	docker build -t agent-backend-dev:latest -f images/Dockerfile.backend-dev .
+	docker build -t agent-fullstack-dev:latest -f images/Dockerfile.fullstack-dev .
 	docker build -t agent-qa:latest -f images/Dockerfile.qa .
 	docker build -t agent-security:latest -f images/Dockerfile.security .
 	@echo "Building daemon..."

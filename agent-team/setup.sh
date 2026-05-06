@@ -115,6 +115,7 @@ for label_info in \
     "architect-in-progress:C49A1C:Architect is working on this" \
     "frontend-dev:4FC1E8:Ready for a Frontend Developer agent" \
     "backend-dev:2A7AB0:Ready for a Backend Developer agent" \
+    "fullstack-dev:8E62D2:Ready for a Fullstack Developer agent (FE + BE in one slice)" \
     "dev-in-progress:1D76DB:Developer is working on this" \
     "needs-fixes:D93F0B:PR needs fixes from review feedback"; do
 

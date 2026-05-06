@@ -1,0 +1,22 @@
+FROM agent-base:latest
+
+LABEL agent.role="fullstack-dev"
+LABEL agent.description="Picks up fullstack-dev issues, writes code spanning frontend and backend, runs tests, opens PRs"
+
+# Both stacks' dev tooling (Node already in base image)
+RUN pip install --break-system-packages \
+    pytest \
+    black \
+    ruff \
+    mypy
+
+RUN npm install -g \
+    jest \
+    vitest \
+    eslint \
+    prettier \
+    typescript
+
+COPY prompts/fullstack-dev.md /prompts/system.md
+
+ENV AGENT_ROLE=fullstack-dev
