@@ -1,0 +1,12 @@
+FROM agent-base:latest
+
+LABEL agent.role="architect-merger"
+LABEL agent.description="Final gate before merge — sanity-checks dual-approved PRs, resolves conflicts, merges"
+
+# Same dependencies as architect — both read code; merger doesn't need build tools
+RUN pip install --break-system-packages \
+    pyyaml
+
+COPY prompts/architect-merger.md /prompts/system.md
+
+ENV AGENT_ROLE=architect-merger

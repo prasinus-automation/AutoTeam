@@ -11,6 +11,7 @@ build:
 	docker build -t agent-base:latest -f images/Dockerfile.base .
 	@echo "Building agent images..."
 	docker build -t agent-architect:latest -f images/Dockerfile.architect .
+	docker build -t agent-architect-merger:latest -f images/Dockerfile.architect-merger .
 	docker build -t agent-frontend-dev:latest -f images/Dockerfile.frontend-dev .
 	docker build -t agent-backend-dev:latest -f images/Dockerfile.backend-dev .
 	docker build -t agent-qa:latest -f images/Dockerfile.qa .

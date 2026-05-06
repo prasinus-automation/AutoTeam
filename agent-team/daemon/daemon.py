@@ -59,11 +59,12 @@ WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 RESOURCE_PROFILES = {
-    "architect":    {"mem_limit": "4g", "cpus": 2.0},
-    "frontend-dev": {"mem_limit": "6g", "cpus": 3.0},
-    "backend-dev":  {"mem_limit": "6g", "cpus": 3.0},
-    "qa":           {"mem_limit": "6g", "cpus": 3.0},
-    "security":     {"mem_limit": "6g", "cpus": 3.0},
+    "architect":         {"mem_limit": "4g", "cpus": 2.0},
+    "architect-merger":  {"mem_limit": "4g", "cpus": 2.0},
+    "frontend-dev":      {"mem_limit": "6g", "cpus": 3.0},
+    "backend-dev":       {"mem_limit": "6g", "cpus": 3.0},
+    "qa":                {"mem_limit": "6g", "cpus": 3.0},
+    "security":          {"mem_limit": "6g", "cpus": 3.0},
 }
 
 # ─── Logging ─────────────────────────────────────────────
@@ -352,10 +353,10 @@ def spawn_agent(role, task_context, issue_or_pr_number):
             log.debug(f"Skipping {role} for #{issue_or_pr_number} — backoff ({remaining}s remaining)")
             return None
         # Global concurrency limit applies to dev agents only.
-        # QA/security/architect are exempt and are also not counted against
-        # the cap — otherwise an active reviewer would block dev spawns even
-        # when no devs are running.
-        if role not in ("qa", "security", "architect"):
+        # QA/security/architect/architect-merger are exempt and are also not
+        # counted against the cap — otherwise an active reviewer would block
+        # dev spawns even when no devs are running.
+        if role not in ("qa", "security", "architect", "architect-merger"):
             dev_count = sum(
                 1 for v in state.active_containers.values()
                 if v.get("role") in ("frontend-dev", "backend-dev")
@@ -569,12 +570,11 @@ def _handle_agent_success(info):
     except Exception as e:
         log.warning(f"usage extract failed for {info['name']}: {e}")
 
-    # Architect declined to merge: detect by checking if the PR is actually
-    # merged after an architect-merge agent exits cleanly. If not merged, the
-    # architect chose not to (usually due to schema drift or arch concerns)
-    # — flip the PR back into the fix loop so a dev gets re-spawned with the
-    # architect's feedback.
-    if info["role"] == "architect" and info.get("action") == "merge_approved_pr":
+    # Architect-merger declined to merge: detect by checking if the PR is
+    # actually merged after the agent exits cleanly. If not merged, the agent
+    # chose not to (usually due to schema drift or arch concerns) — flip the
+    # PR back into the fix loop so a dev gets re-spawned with the feedback.
+    if info["role"] == "architect-merger":
         pr_number = info["number"]
         try:
             r = requests.get(
@@ -1081,14 +1081,16 @@ def dispatch_needs_fixes(pr):
 
 
 def dispatch_architect_merge(pr):
-    """Spawn architect to merge an approved PR."""
+    """Spawn architect-merger (separate role from the planner) to merge an
+    approved PR. Splitting planning and merging keeps each prompt tight to
+    its job and limits the blast radius of a misbehaving planner."""
     number = pr["number"]
     key = f"merge-{number}"
     if state.already_handled(key):
         return
 
-    log.info(f"Both approved: PR #{number} — spawning Architect to merge")
-    result = spawn_agent("architect", {
+    log.info(f"Both approved: PR #{number} — spawning architect-merger")
+    result = spawn_agent("architect-merger", {
         "action": "merge_approved_pr",
         "pr_number": number,
         "pr_title": pr["title"],
@@ -1097,7 +1099,6 @@ def dispatch_architect_merge(pr):
         "pr_branch": pr.get("head", {}).get("ref", ""),
     }, number)
     if result is None:
-        # Spawn failed — clear handled state so it retries on next poll
         state.clear_handled(key)
 
 
@@ -1721,8 +1722,8 @@ def main():
             image="agent-base:latest",
             entrypoint="bash",
             command=["-c",
-                "mkdir -p /memory/agents/{architect,frontend-dev,backend-dev,qa,security} "
-                "/memory/inbox/{architect,frontend-dev,backend-dev,qa,security} "
+                "mkdir -p /memory/agents/{architect,architect-merger,frontend-dev,backend-dev,qa,security} "
+                "/memory/inbox/{architect,architect-merger,frontend-dev,backend-dev,qa,security} "
                 "/memory/issues"
             ],
             volumes={MEMORY_VOLUME: {"bind": "/memory", "mode": "rw"}},
