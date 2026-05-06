@@ -1059,17 +1059,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
-        # Verify HMAC signature if secret is configured
-        if WEBHOOK_SECRET:
-            signature = self.headers.get("X-Hub-Signature-256", "")
-            expected = "sha256=" + hmac.new(
-                WEBHOOK_SECRET.encode(), body, hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(signature, expected):
-                log.warning("Invalid webhook signature — rejected")
-                self.send_response(403)
-                self.end_headers()
-                return
+        # WEBHOOK_SECRET is required at startup in webhook mode (see main),
+        # so signature verification is unconditional here.
+        signature = self.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(
+            WEBHOOK_SECRET.encode(), body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            log.warning("Invalid webhook signature — rejected")
+            self.send_response(403)
+            self.end_headers()
+            return
 
         event = self.headers.get("X-GitHub-Event", "")
         payload = json.loads(body)
@@ -1596,6 +1596,13 @@ def status_line():
 # ─── Main ────────────────────────────────────────────────
 
 def main():
+    if MODE == "webhook" and not WEBHOOK_SECRET:
+        # An empty secret silently disables HMAC verification. Cloudflare
+        # tunnel obscurity is not auth — anyone who learns the URL can
+        # trigger arbitrary agent spawns. Hard-fail rather than degrade.
+        log.error("WEBHOOK_SECRET is empty in webhook mode. Set it in .env and restart.")
+        sys.exit(1)
+
     log.info("═══════════════════════════════════════")
     log.info(f"  Agent Team Daemon")
     log.info(f"  Mode: {MODE}")
