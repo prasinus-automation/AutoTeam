@@ -32,8 +32,10 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-30}
       - MAX_FRONTEND_AGENTS=${MAX_FRONTEND_AGENTS:-2}
       - MAX_BACKEND_AGENTS=${MAX_BACKEND_AGENTS:-2}
+      - MAX_FULLSTACK_AGENTS=${MAX_FULLSTACK_AGENTS:-1}
       - MAX_FIX_ITERATIONS=${MAX_FIX_ITERATIONS:-3}
       - MAX_TOTAL_AGENTS=${MAX_TOTAL_AGENTS:-3}
+      - DAILY_BUDGET_USD=${DAILY_BUDGET_USD:-0}
       - LOG_DIR=/logs
       - REPO_CACHE_VOLUME=${COMPOSE_PROJECT_NAME:-agent-team}_repo-cache
       - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agent-team}
@@ -70,6 +72,15 @@ services:
       - agent-base
     profiles: ["build-only"]
 
+  agent-architect-merger:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.architect-merger
+    image: agent-architect-merger:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
   agent-frontend-dev:
     build:
       context: .
@@ -84,6 +95,15 @@ services:
       context: .
       dockerfile: images/Dockerfile.backend-dev
     image: agent-backend-dev:latest
+    depends_on:
+      - agent-base
+    profiles: ["build-only"]
+
+  agent-fullstack-dev:
+    build:
+      context: .
+      dockerfile: images/Dockerfile.fullstack-dev
+    image: agent-fullstack-dev:latest
     depends_on:
       - agent-base
     profiles: ["build-only"]
