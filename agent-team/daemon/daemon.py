@@ -1101,48 +1101,71 @@ def dispatch_architect_merge(pr):
         state.clear_handled(key)
 
 
-def _check_both_approved(pr_number, pr_api_url, latest_comment):
-    """Check PR comments for both QA and Security approval, then merge."""
+def _classify_pr_reviews(comments):
+    """Walk comments newest-first and return (qa_state, sec_state) where each
+    is 'approved', 'changes', or None. Only the LATEST review of each kind
+    is consulted — historical state doesn't matter once new reviews land."""
+    qa_state = None
+    sec_state = None
+    for c in reversed(comments):
+        body = c.get("body", "") or ""
+        # Skip daemon-posted notices so we never match our own headers
+        if body.startswith("⚠️ Agent ") or body.startswith("⏳ Agent ") or "Daemon-verified:" in body:
+            continue
+        header = body.split("\n")[0]
+        upper = header.upper()
+        if qa_state is None and "QA REVIEW" in upper:
+            if "CHANGES REQUESTED" in upper:
+                qa_state = "changes"
+            elif "APPROVED" in upper or "✅" in header:
+                qa_state = "approved"
+        if sec_state is None and "SECURITY REVIEW" in upper:
+            if "CHANGES REQUESTED" in upper:
+                sec_state = "changes"
+            elif "APPROVED" in upper or "✅" in header:
+                sec_state = "approved"
+        if qa_state is not None and sec_state is not None:
+            break
+    return qa_state, sec_state
+
+
+def _on_review_approved(pr_number, pr_api_url):
+    """Reviews are sequential: QA runs first, Security runs after QA approves,
+    architect-merge runs after both approve. This is the single decision point
+    consulted whenever an approval comment / review lands."""
     try:
-        # Fetch all comments on the PR
         resp = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-            headers={"Authorization": f"token {GITHUB_TOKEN}",
-                     "Accept": "application/vnd.github.v3+json"},
+            f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+            headers=HEADERS,
+            params={"per_page": 100},
         )
         comments = resp.json() if resp.status_code == 200 else []
-        all_text = " ".join(c.get("body", "") for c in comments)
-
-        has_qa = "QA Review" in all_text or "QA review" in all_text
-        has_security = "Security Review" in all_text or "Security review" in all_text
-        qa_approved = has_qa and ("APPROVED" in all_text.upper() or "✅" in all_text)
-        security_approved = has_security and any(
-            ("Security" in c.get("body", "") and ("APPROVED" in c.get("body", "").upper() or "✅" in c.get("body", "")))
-            for c in comments
-        )
-
-        if qa_approved and security_approved:
-            # Fetch full PR object for dispatch
-            pr_resp = requests.get(
-                pr_api_url,
-                headers={"Authorization": f"token {GITHUB_TOKEN}",
-                         "Accept": "application/vnd.github.v3+json"},
-            )
-            if pr_resp.status_code == 200:
-                dispatch_architect_merge(pr_resp.json())
-            else:
-                log.warning(f"Could not fetch PR #{pr_number}: HTTP {pr_resp.status_code}")
-        else:
-            log.info(f"PR #{pr_number} — QA approved: {qa_approved}, Security approved: {security_approved}")
+        if not isinstance(comments, list):
+            comments = []
     except Exception as e:
-        log.error(f"Error checking approvals for PR #{pr_number}: {e}")
+        log.error(f"Approval check for PR #{pr_number}: {e}")
+        return
 
+    qa_state, sec_state = _classify_pr_reviews(comments)
 
-def _check_both_approved_from_review(pr):
-    """Fallback: check via formal review (works if different tokens are used)."""
-    number = pr["number"]
-    pr_url = pr.get("url", f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{number}")
-    _check_both_approved(number, pr_url, "")
+    def _fetch_pr():
+        try:
+            r = requests.get(pr_api_url, headers=HEADERS)
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            log.error(f"Fetch PR #{pr_number}: {e}")
+            return None
+
+    if qa_state == "approved" and sec_state is None:
+        pr = _fetch_pr()
+        if pr:
+            dispatch_security(pr)
+    elif qa_state == "approved" and sec_state == "approved":
+        pr = _fetch_pr()
+        if pr:
+            dispatch_architect_merge(pr)
+    else:
+        log.info(f"PR #{pr_number} — qa={qa_state}, security={sec_state}; waiting")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1242,16 +1265,15 @@ def handle_webhook_event(event, payload):
             dispatch_dependents(pr)
 
     # ── PR opened or updated ──────────────────────────
-    # Run QA and Security in parallel (agents share a token so formal
-    # PR approvals don't work — we track approval via comments instead)
+    # Reviews run sequentially: QA first; Security runs only after QA
+    # approves. Agents share a token so formal PR approvals don't work —
+    # approval is detected from comment headers instead.
     elif event == "pull_request" and action in ("opened", "reopened", "synchronize"):
         pr = payload.get("pull_request", {})
         if not pr.get("draft"):
-            # Clear previous review state so QA/Security re-run on new code
             state.clear_handled(f"qa-{pr['number']}")
             state.clear_handled(f"security-{pr['number']}")
             dispatch_qa(pr)
-            dispatch_security(pr)
 
     # ── PR labeled (needs-fixes) ──────────────────────
     elif event == "pull_request" and action == "labeled":
@@ -1291,14 +1313,16 @@ def handle_webhook_event(event, payload):
                     log.error(f"Error triggering fixes for PR #{pr_number}: {e}")
             elif "APPROVED" in comment_header.upper() or "✅" in comment_header:
                 if pr_url:
-                    _check_both_approved(pr_number, pr_url, comment_body)
+                    _on_review_approved(pr_number, pr_url)
 
     # ── PR review submitted (fallback) ────────────────
     elif event == "pull_request_review" and action == "submitted":
         review = payload.get("review", {})
         pr = payload.get("pull_request", {})
         if review.get("state") == "approved":
-            _check_both_approved_from_review(pr)
+            number = pr["number"]
+            pr_url = pr.get("url", f"{API}/repos/{GITHUB_REPO}/pulls/{number}")
+            _on_review_approved(number, pr_url)
 
     # ── Ping (setup confirmation) ─────────────────────
     elif event == "ping":
@@ -1544,21 +1568,20 @@ def poll_github():
                         last_fix_time = c.get("created_at", "")
 
                 if last_fix_time and last_review_time and last_fix_time > last_review_time:
-                    # Dev already fixed — re-trigger reviewers
-                    log.info(f"PR #{pr_number} — fix exists after last review, re-triggering reviewers")
+                    # Dev already fixed — re-trigger QA. Security runs after
+                    # QA approves under the sequential review flow.
+                    log.info(f"PR #{pr_number} — fix exists after last review, re-triggering QA")
                     state.clear_handled(f"qa-{pr_number}")
                     state.clear_handled(f"security-{pr_number}")
                     dispatch_qa(pr)
-                    dispatch_security(pr)
                 else:
                     dispatch_needs_fixes(pr)
             else:
-                # Dispatch whichever reviewers haven't run yet
-                # Clear handled state so dispatch_qa/dispatch_security can proceed
+                # Sequential dispatch: QA first; Security only after QA approves.
                 if not has_qa:
                     state.clear_handled(f"qa-{pr_number}")
                     dispatch_qa(pr)
-                if not has_sec:
+                elif last_qa_approved and not has_sec:
                     state.clear_handled(f"security-{pr_number}")
                     dispatch_security(pr)
         except Exception as e:
