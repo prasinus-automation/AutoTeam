@@ -441,14 +441,22 @@ def spawn_agent(role, task_context, issue_or_pr_number):
 
 
 def monitor_container(container_id):
-    try:
-        info = state.active_containers.get(container_id)
-        if not info:
-            return
+    # Cleanup is unified in `finally` so the active_containers dict and the
+    # per-role counts can never drift apart. The only path that decrements
+    # a count is the `pop` in finally — guarantees exactly-once cleanup
+    # regardless of where in the body an exception lands.
+    info = state.active_containers.get(container_id)
+    if not info:
+        return
 
+    try:
         container = info["container"]
-        result = container.wait()
-        exit_code = result.get("StatusCode", -1)
+        try:
+            result = container.wait()
+            exit_code = result.get("StatusCode", -1)
+        except Exception as e:
+            log.error(f"Monitor wait failed for {info['name']}: {e}")
+            exit_code = -1
 
         try:
             logs = container.logs(tail=100).decode("utf-8", errors="replace")
@@ -458,145 +466,130 @@ def monitor_container(container_id):
             pass
 
         if exit_code == 0:
-            log.info(f"✓ {info['name']} completed")
-            # Clear retry state on success
-            retry_key = f"{info['role']}-{info['number']}"
-            with state.lock:
-                state.retry_counts.pop(retry_key, None)
-                state.retry_backoff_until.pop(retry_key, None)
-            # Agents post their own review comments directly — no need for
-            # daemon-verified duplicates (they spam the PR and break pagination).
-
-            # Architect declined to merge: detect by checking if the PR is
-            # actually merged after an architect-merge agent exits cleanly.
-            # If not merged, the architect chose not to (usually due to schema
-            # drift or arch concerns) — flip the PR back into the fix loop so
-            # a dev gets re-spawned with the architect's feedback.
-            if info["role"] == "architect" and info.get("action") == "merge_approved_pr":
-                pr_number = info["number"]
-                try:
-                    r = requests.get(
-                        f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}",
-                        headers=HEADERS,
-                    )
-                    if r.status_code == 200 and not r.json().get("merged"):
-                        log.warning(f"Architect declined to merge PR #{pr_number} — flipping to needs-fixes")
-                        # Post a synthesizing CHANGES REQUESTED comment so
-                        # _latest_reviews_approved() returns False on the
-                        # next dispatch — otherwise the daemon would skip
-                        # the fix because QA/Security previously approved.
-                        gh_comment(pr_number,
-                                   "## QA Review — CHANGES REQUESTED\n\n"
-                                   "Re-opening review after the architect declined the merge. "
-                                   "See the architect's most recent comment on this PR for the "
-                                   "specific issues that need to be addressed before this can land.")
-                        gh_add_label(pr_number, "needs-fixes")
-                        # Clear merge handled state so it can re-trigger after fix
-                        state.clear_handled(f"merge-{pr_number}")
-                except Exception as e:
-                    log.error(f"Architect-decline check for PR #{pr_number}: {e}")
+            _handle_agent_success(info)
         else:
-            log.warning(f"✗ {info['name']} exited ({exit_code})")
-
-            # Classify exit reason from logs
-            is_auth_error = False
-            is_transient = False
-            try:
-                logs_text = container.logs(tail=50).decode("utf-8", errors="replace").lower()
-                is_auth_error = any(s in logs_text for s in [
-                    "authentication_error", "401", "invalid authentication",
-                ])
-                is_transient = is_auth_error or any(s in logs_text for s in [
-                    "rate limit", "usage limit", "too many requests",
-                    "429", "overloaded", "capacity",
-                ])
-            except Exception:
-                pass
-
-            if is_transient:
-                retry_key = f"{info['role']}-{info['number']}"
-                with state.lock:
-                    retries = state.retry_counts.get(retry_key, 0) + 1
-                    state.retry_counts[retry_key] = retries
-
-                # Auth errors are Anthropic-side transient issues (brief token
-                # revocations, upstream 401s). Retry indefinitely with a longer
-                # initial backoff — capped at TRANSIENT_BACKOFF_MAX. Non-auth
-                # transients (real rate limits) still give up after MAX_TRANSIENT_RETRIES.
-                if is_auth_error:
-                    backoff = min(
-                        AUTH_ERROR_BACKOFF_BASE * (2 ** (retries - 1)),
-                        TRANSIENT_BACKOFF_MAX,
-                    )
-                    give_up = False
-                else:
-                    backoff = min(
-                        TRANSIENT_BACKOFF_BASE * (2 ** (retries - 1)),
-                        TRANSIENT_BACKOFF_MAX,
-                    )
-                    give_up = retries > MAX_TRANSIENT_RETRIES
-
-                backoff_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
-                with state.lock:
-                    state.retry_backoff_until[retry_key] = backoff_until
-
-                if give_up:
-                    # Still set backoff so recovery poll doesn't tight-loop.
-                    # A long cooldown gives the human time to intervene without
-                    # the daemon spamming GitHub with retries in the meantime.
-                    log.warning(f"✗ {info['name']} exceeded max transient retries ({MAX_TRANSIENT_RETRIES}) — cooldown {backoff}s")
-                    gh_comment(info["number"],
-                               f"⚠️ Agent `{info['role']}` failed after {MAX_TRANSIENT_RETRIES} retries "
-                               f"(rate limit / transient error). Requires manual intervention. "
-                               f"Daemon will cool down for {backoff//60}m before trying again.")
-                else:
-                    state.clear_handled(f"{info['role']}-{info['number']}")
-                    if info["role"] in ("frontend-dev", "backend-dev"):
-                        gh_remove_label(info["number"], "dev-in-progress")
-                        gh_add_label(info["number"], info["role"])
-                    elif info["role"] == "architect":
-                        gh_remove_label(info["number"], "architect-in-progress")
-                        gh_add_label(info["number"], "architect")
-
-                    kind = "auth" if is_auth_error else "transient"
-                    if retries == 1:
-                        gh_comment(info["number"],
-                                   f"⏳ Agent `{info['role']}` hit a {kind} error. "
-                                   f"Will retry in {backoff}s.")
-                    log.info(f"↻ {info['name']} {kind} error — retry {retries} "
-                             f"in {backoff}s")
-            else:
-                gh_comment(info["number"],
-                           f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
+            _handle_agent_failure(info, container, exit_code)
 
         try:
             container.remove()
         except Exception:
             pass
 
+    except Exception as e:
+        log.error(f"Monitor error for {info.get('name', container_id)}: {e}", exc_info=True)
+    finally:
         is_dev = info["role"] in ("frontend-dev", "backend-dev")
         with state.lock:
-            state.active_containers.pop(container_id, None)
-            if info["role"] == "frontend-dev":
-                state.frontend_dev_count -= 1
-            elif info["role"] == "backend-dev":
-                state.backend_dev_count -= 1
-
-        if is_dev:
-            drain_queue()
-
-    except Exception as e:
-        log.error(f"Monitor error: {e}")
-        with state.lock:
-            info = state.active_containers.pop(container_id, None)
-            if info:
-                is_dev = info["role"] in ("frontend-dev", "backend-dev")
+            popped = state.active_containers.pop(container_id, None)
+            if popped is not None:
                 if info["role"] == "frontend-dev":
                     state.frontend_dev_count -= 1
                 elif info["role"] == "backend-dev":
                     state.backend_dev_count -= 1
-        if info and is_dev:
+        if is_dev:
             drain_queue()
+
+
+def _handle_agent_success(info):
+    log.info(f"✓ {info['name']} completed")
+    retry_key = f"{info['role']}-{info['number']}"
+    with state.lock:
+        state.retry_counts.pop(retry_key, None)
+        state.retry_backoff_until.pop(retry_key, None)
+
+    # Architect declined to merge: detect by checking if the PR is actually
+    # merged after an architect-merge agent exits cleanly. If not merged, the
+    # architect chose not to (usually due to schema drift or arch concerns)
+    # — flip the PR back into the fix loop so a dev gets re-spawned with the
+    # architect's feedback.
+    if info["role"] == "architect" and info.get("action") == "merge_approved_pr":
+        pr_number = info["number"]
+        try:
+            r = requests.get(
+                f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}",
+                headers=HEADERS,
+            )
+            if r.status_code == 200 and not r.json().get("merged"):
+                log.warning(f"Architect declined to merge PR #{pr_number} — flipping to needs-fixes")
+                # Post a synthesizing CHANGES REQUESTED comment so
+                # _latest_reviews_approved() returns False on the next
+                # dispatch — otherwise the daemon would skip the fix because
+                # QA/Security previously approved.
+                gh_comment(pr_number,
+                           "## QA Review — CHANGES REQUESTED\n\n"
+                           "Re-opening review after the architect declined the merge. "
+                           "See the architect's most recent comment on this PR for the "
+                           "specific issues that need to be addressed before this can land.")
+                gh_add_label(pr_number, "needs-fixes")
+                state.clear_handled(f"merge-{pr_number}")
+        except Exception as e:
+            log.error(f"Architect-decline check for PR #{pr_number}: {e}")
+
+
+def _handle_agent_failure(info, container, exit_code):
+    log.warning(f"✗ {info['name']} exited ({exit_code})")
+
+    is_auth_error = False
+    is_transient = False
+    try:
+        logs_text = container.logs(tail=50).decode("utf-8", errors="replace").lower()
+        is_auth_error = any(s in logs_text for s in [
+            "authentication_error", "401", "invalid authentication",
+        ])
+        is_transient = is_auth_error or any(s in logs_text for s in [
+            "rate limit", "usage limit", "too many requests",
+            "429", "overloaded", "capacity",
+        ])
+    except Exception:
+        pass
+
+    if not is_transient:
+        gh_comment(info["number"],
+                   f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
+        return
+
+    retry_key = f"{info['role']}-{info['number']}"
+    with state.lock:
+        retries = state.retry_counts.get(retry_key, 0) + 1
+        state.retry_counts[retry_key] = retries
+
+    # Auth errors are Anthropic-side transient issues (brief token revocations,
+    # upstream 401s). Retry indefinitely with a longer initial backoff — capped
+    # at TRANSIENT_BACKOFF_MAX. Non-auth transients (real rate limits) still
+    # give up after MAX_TRANSIENT_RETRIES.
+    if is_auth_error:
+        backoff = min(AUTH_ERROR_BACKOFF_BASE * (2 ** (retries - 1)), TRANSIENT_BACKOFF_MAX)
+        give_up = False
+    else:
+        backoff = min(TRANSIENT_BACKOFF_BASE * (2 ** (retries - 1)), TRANSIENT_BACKOFF_MAX)
+        give_up = retries > MAX_TRANSIENT_RETRIES
+
+    backoff_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+    with state.lock:
+        state.retry_backoff_until[retry_key] = backoff_until
+
+    if give_up:
+        # Still set backoff so recovery poll doesn't tight-loop.
+        log.warning(f"✗ {info['name']} exceeded max transient retries ({MAX_TRANSIENT_RETRIES}) — cooldown {backoff}s")
+        gh_comment(info["number"],
+                   f"⚠️ Agent `{info['role']}` failed after {MAX_TRANSIENT_RETRIES} retries "
+                   f"(rate limit / transient error). Requires manual intervention. "
+                   f"Daemon will cool down for {backoff//60}m before trying again.")
+        return
+
+    state.clear_handled(f"{info['role']}-{info['number']}")
+    if info["role"] in ("frontend-dev", "backend-dev"):
+        gh_remove_label(info["number"], "dev-in-progress")
+        gh_add_label(info["number"], info["role"])
+    elif info["role"] == "architect":
+        gh_remove_label(info["number"], "architect-in-progress")
+        gh_add_label(info["number"], "architect")
+
+    kind = "auth" if is_auth_error else "transient"
+    if retries == 1:
+        gh_comment(info["number"],
+                   f"⏳ Agent `{info['role']}` hit a {kind} error. Will retry in {backoff}s.")
+    log.info(f"↻ {info['name']} {kind} error — retry {retries} in {backoff}s")
 
 
 # ─── Event Dispatch ──────────────────────────────────────
