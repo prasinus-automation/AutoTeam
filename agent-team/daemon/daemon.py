@@ -46,6 +46,9 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 MAX_FRONTEND_AGENTS = int(os.environ.get("MAX_FRONTEND_AGENTS", "2"))
 MAX_BACKEND_AGENTS = int(os.environ.get("MAX_BACKEND_AGENTS", "2"))
 MAX_FULLSTACK_AGENTS = int(os.environ.get("MAX_FULLSTACK_AGENTS", "1"))
+# Spend cap (USD) per UTC day. 0 = no cap. Once exceeded, new spawns are
+# refused until the next day rollover. In-flight agents are unaffected.
+DAILY_BUDGET_USD = float(os.environ.get("DAILY_BUDGET_USD", "0"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 MAX_TRANSIENT_RETRIES = int(os.environ.get("MAX_TRANSIENT_RETRIES", "5"))
 TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # seconds
@@ -327,6 +330,13 @@ class DaemonState:
             "runs": 0,
         }
         self.usage_by_role = {}  # role -> totals dict (same shape as above)
+        # Daily cost rollup; resets when current UTC date changes.
+        self.daily_cost_usd = 0.0
+        self.daily_cost_date = datetime.now(timezone.utc).date()
+        # Pause flag — when set, spawn_agent returns None without spawning.
+        # Webhooks are still received and parsed; in-flight agents complete.
+        self.paused = False
+        self.paused_reason = ""
         self.lock = threading.Lock()
 
     def already_handled(self, key):
@@ -369,6 +379,23 @@ def _dev_role_at_capacity(role):
 
 def spawn_agent(role, task_context, issue_or_pr_number):
     with state.lock:
+        # Pause flag — refuse new spawns. In-flight agents continue.
+        if state.paused:
+            log.info(f"Paused — skipping {role} for #{issue_or_pr_number} ({state.paused_reason or 'no reason set'})")
+            return None
+        # Daily budget check. Reset the daily counter if the UTC date rolled
+        # over since the last record was written.
+        if DAILY_BUDGET_USD > 0:
+            today = datetime.now(timezone.utc).date()
+            if state.daily_cost_date != today:
+                state.daily_cost_date = today
+                state.daily_cost_usd = 0.0
+            if state.daily_cost_usd >= DAILY_BUDGET_USD:
+                log.warning(
+                    f"Daily budget reached (${state.daily_cost_usd:.2f} / "
+                    f"${DAILY_BUDGET_USD:.2f}) — refusing {role} for #{issue_or_pr_number}"
+                )
+                return None
         # Prevent duplicate agents for the same role + issue/PR
         for info in state.active_containers.values():
             if info["role"] == role and info["number"] == issue_or_pr_number:
@@ -571,6 +598,14 @@ def _record_usage(info, marker):
             per_role[key] += record[key]
         per_role["cost_usd"] += cost
         per_role["runs"] += 1
+
+        # Daily rollup. If the UTC date rolled over since the last record,
+        # reset to today's accumulation rather than carrying yesterday's total.
+        today = datetime.now(timezone.utc).date()
+        if state.daily_cost_date != today:
+            state.daily_cost_date = today
+            state.daily_cost_usd = 0.0
+        state.daily_cost_usd += cost
 
 
 def _handle_agent_success(info):
@@ -1230,6 +1265,32 @@ class WebhookHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
+        # /pause and /resume are local control endpoints — protected by HMAC
+        # like webhooks, so the same WEBHOOK_SECRET is the shared credential.
+        # They flip state.paused so spawn_agent refuses new work.
+        if self.path in ("/pause", "/resume"):
+            signature = self.headers.get("X-Hub-Signature-256", "")
+            expected = "sha256=" + hmac.new(
+                WEBHOOK_SECRET.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                self.send_response(403)
+                self.end_headers()
+                return
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                payload = {}
+            with state.lock:
+                state.paused = (self.path == "/pause")
+                state.paused_reason = payload.get("reason", "") if state.paused else ""
+            log.info(f"Daemon {'paused' if state.paused else 'resumed'} via HTTP")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"paused": state.paused}).encode())
+            return
+
         # WEBHOOK_SECRET is required at startup in webhook mode (see main),
         # so signature verification is unconditional here.
         signature = self.headers.get("X-Hub-Signature-256", "")
@@ -1265,22 +1326,52 @@ class WebhookHandler(BaseHTTPRequestHandler):
         with state.lock:
             active = [{"role": v["role"], "issue": v["number"]}
                       for v in state.active_containers.values()]
-            queue_len = len(state.dev_queue)
+            queue = [{"role": r, "issue": i["number"], "title": i.get("title", "")}
+                     for r, i in state.dev_queue]
             pending_fixes = sorted(state.pending_fix_prs)
             usage_totals = dict(state.usage_totals)
             usage_by_role = {k: dict(v) for k, v in state.usage_by_role.items()}
+            paused = state.paused
+            paused_reason = state.paused_reason
+            daily_cost = state.daily_cost_usd
+            daily_date = state.daily_cost_date.isoformat()
+            now = datetime.now(timezone.utc)
+            retries = {
+                k: {
+                    "attempts": v,
+                    "backoff_until": (
+                        state.retry_backoff_until[k].isoformat()
+                        if k in state.retry_backoff_until else None
+                    ),
+                    "backoff_remaining_s": (
+                        max(0, int((state.retry_backoff_until[k] - now).total_seconds()))
+                        if k in state.retry_backoff_until else None
+                    ),
+                }
+                for k, v in state.retry_counts.items()
+            }
         self.wfile.write(json.dumps({
             "status": "ok",
+            "paused": paused,
+            "paused_reason": paused_reason,
             "mode": MODE,
             "repo": GITHUB_REPO,
             "active_agents": active,
             "frontend_dev_slots": f"{state.frontend_dev_count}/{MAX_FRONTEND_AGENTS}",
             "backend_dev_slots": f"{state.backend_dev_count}/{MAX_BACKEND_AGENTS}",
             "fullstack_dev_slots": f"{state.fullstack_dev_count}/{MAX_FULLSTACK_AGENTS}",
-            "dev_queue_length": queue_len,
+            "dev_queue_length": len(queue),
+            "dev_queue": queue,
             "pending_fix_prs": pending_fixes,
             "max_total_agents": MAX_TOTAL_AGENTS,
             "credentials": _credentials_status(),
+            "retries": retries,
+            "budget": {
+                "daily_limit_usd": DAILY_BUDGET_USD,
+                "daily_spent_usd": round(daily_cost, 4),
+                "daily_date_utc": daily_date,
+                "exceeded": (DAILY_BUDGET_USD > 0 and daily_cost >= DAILY_BUDGET_USD),
+            },
             "usage": {
                 "since_start": usage_totals,
                 "by_role": usage_by_role,

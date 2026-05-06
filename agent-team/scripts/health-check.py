@@ -59,6 +59,12 @@ ESCALATION_COOLDOWN_HOURS = 24        # do not re-escalate the same pattern with
 # be used to write to this repo as long as the PAT has access to it.
 AUTOTEAM_REPO = "prasinus-automation/AutoTeam"
 CREDENTIAL_ALERT_TITLE = "AutoTeam credentials expired — run `claude /login` on the host"
+PRESSURE_ALERT_TITLE = "AutoTeam pipeline pressure — daemons reporting stuck retries / deep queues / budget hits"
+
+# Thresholds for the pipeline-pressure alert. Tuned for hobby scale —
+# any retry that's been backing off and any queue >= 5 is actionable.
+PRESSURE_RETRY_THRESHOLD = 3       # retry attempts considered "persistent"
+PRESSURE_QUEUE_DEPTH_THRESHOLD = 5  # dev_queue this deep is worth surfacing
 
 API_BASE = "https://api.github.com"
 
@@ -669,6 +675,120 @@ def check_credentials(projects: list[dict], dry_run: bool) -> None:
             log.error(f"Failed to file credential alert issue: status={status} resp={created}")
 
 
+def _pipeline_pressure_signals(daemon: dict) -> list[str]:
+    """Inspect a daemon's /health response and return a list of human-readable
+    pressure signals (persistent retries, deep queues, budget hits). Empty
+    list = healthy."""
+    signals = []
+    retries = daemon.get("retries") or {}
+    stuck = [k for k, v in retries.items() if v.get("attempts", 0) >= PRESSURE_RETRY_THRESHOLD]
+    if stuck:
+        signals.append(f"persistent retries on {len(stuck)} agent(s): {', '.join(sorted(stuck))}")
+
+    queue_len = daemon.get("dev_queue_length", 0)
+    if queue_len >= PRESSURE_QUEUE_DEPTH_THRESHOLD:
+        signals.append(f"dev_queue depth {queue_len}")
+
+    budget = daemon.get("budget") or {}
+    if budget.get("exceeded"):
+        spent = budget.get("daily_spent_usd")
+        limit = budget.get("daily_limit_usd")
+        signals.append(f"daily budget hit (${spent} / ${limit})")
+
+    if daemon.get("paused"):
+        reason = daemon.get("paused_reason", "")
+        signals.append(f"paused{f' — {reason}' if reason else ''}")
+    return signals
+
+
+def check_pipeline_pressure(projects: list[dict], dry_run: bool) -> None:
+    """File / refresh / close a single rolling alert issue based on the
+    pressure signals each project's daemon exposes on /health. Mirrors the
+    credential-alert pattern: one issue, refreshed in place, closed once
+    everything is healthy again."""
+    pressured: list[tuple[str, list[str]]] = []
+    for project in projects:
+        daemon = daemon_health(project["webhook_port"])
+        if daemon is None:
+            continue
+        signals = _pipeline_pressure_signals(daemon)
+        if signals:
+            pressured.append((project["name"], signals))
+
+    if not projects:
+        return
+    token = projects[0]["token"]
+
+    # Find the existing alert issue by exact title match.
+    _, items = gh_get(
+        f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues?state=open&per_page=50",
+        token,
+    )
+    existing = None
+    if isinstance(items, list):
+        for it in items:
+            if "pull_request" in it:
+                continue
+            if it.get("title") == PRESSURE_ALERT_TITLE:
+                existing = it
+                break
+
+    if not pressured:
+        if existing:
+            if dry_run:
+                log.info(f"[DRY-RUN] Would close pipeline pressure issue #{existing['number']}")
+            else:
+                gh_request(
+                    "PATCH",
+                    f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues/{existing['number']}",
+                    token,
+                    {"state": "closed", "state_reason": "completed"},
+                )
+                log.info(f"Closed pipeline pressure issue #{existing['number']}")
+        return
+
+    log.warning(f"PIPELINE PRESSURE: {len(pressured)} project(s) reporting signals")
+    for name, signals in pressured:
+        for s in signals:
+            log.warning(f"  {name}: {s}")
+
+    if dry_run:
+        log.info("[DRY-RUN] Would file/refresh pipeline pressure issue")
+        return
+
+    body_lines = [
+        "The hourly health check found one or more daemons under pressure. Investigate the daemon's `/health` endpoint or `make logs` on the host for context.",
+        "",
+    ]
+    for name, signals in pressured:
+        body_lines.append(f"### `{name}`")
+        for s in signals:
+            body_lines.append(f"- {s}")
+        body_lines.append("")
+    body_lines.append(f"_Detected at {datetime.now(timezone.utc).isoformat()} by `health-check.py`._")
+    body_lines.append("")
+    body_lines.append("This issue closes itself once the next health-check run sees all daemons healthy.")
+    body = "\n".join(body_lines)
+
+    if existing:
+        gh_request(
+            "PATCH",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues/{existing['number']}",
+            token,
+            {"body": body, "state": "open"},
+        )
+        log.warning(f"Refreshed pipeline pressure issue #{existing['number']} on {AUTOTEAM_REPO}")
+    else:
+        _, created = gh_request(
+            "POST",
+            f"{API_BASE}/repos/{AUTOTEAM_REPO}/issues",
+            token,
+            {"title": PRESSURE_ALERT_TITLE, "body": body},
+        )
+        if isinstance(created, dict) and created.get("number"):
+            log.warning(f"Filed pipeline pressure issue #{created['number']} on {AUTOTEAM_REPO}: {created.get('html_url')}")
+
+
 def maybe_close_credential_alert(projects: list[dict], dry_run: bool) -> None:
     """If credentials are healthy and there's an open alert issue, close it."""
     # Only close if EVERY daemon we can reach reports healthy credentials.
@@ -736,6 +856,7 @@ def main() -> int:
     if projects:
         check_credentials(projects, args.dry_run)
         maybe_close_credential_alert(projects, args.dry_run)
+        check_pipeline_pressure(projects, args.dry_run)
 
     total_incidents = 0
     total_remediated = 0
