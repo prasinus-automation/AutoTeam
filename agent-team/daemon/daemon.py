@@ -1129,43 +1129,95 @@ def _classify_pr_reviews(comments):
     return qa_state, sec_state
 
 
-def _on_review_approved(pr_number, pr_api_url):
-    """Reviews are sequential: QA runs first, Security runs after QA approves,
-    architect-merge runs after both approve. This is the single decision point
-    consulted whenever an approval comment / review lands."""
+def _fetch_pr_comments_last_page(pr_number):
+    """Fetch the LAST page of issue comments. The Issues Comments API returns
+    chronologically and the most recent reviews live on the last page when a
+    PR has many comments, so paginate to the tail rather than reading page 1."""
+    resp = requests.get(
+        f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+        headers=HEADERS,
+        params={"per_page": 100},
+    )
+    if resp.status_code != 200:
+        return []
+    link_header = resp.headers.get("Link", "")
+    if 'rel="last"' in link_header:
+        m = re.search(r'<([^>]+)>;\s*rel="last"', link_header)
+        if m:
+            last_resp = requests.get(m.group(1), headers=HEADERS)
+            if last_resp.status_code == 200:
+                data = last_resp.json()
+                return data if isinstance(data, list) else []
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+def _find_last_review_and_fix(comments):
+    """Walk comments and return (last_changes_requested_time, last_fix_time)
+    for deciding whether a dev fix was already posted after the last review."""
+    last_review_time = None
+    last_fix_time = None
+    for c in comments:
+        body = c.get("body", "") or ""
+        header = body.split("\n")[0]
+        if ("QA Review" in header or "Security Review" in header) and "CHANGES REQUESTED" in header.upper():
+            last_review_time = c.get("created_at", "")
+        if body.startswith("## Fix iteration") or body.startswith("## Review feedback addressed"):
+            last_fix_time = c.get("created_at", "")
+    return last_review_time, last_fix_time
+
+
+def reconcile_pr(pr):
+    """Decide what to do with an open PR based on its latest review state.
+    The single source of truth for both `_on_review_approved` (event-driven)
+    and `poll_github`'s recovery scan (periodic). Sequential review flow:
+    QA → Security → architect-merge."""
+    if pr.get("draft"):
+        return
+    pr_number = pr["number"]
+
     try:
-        resp = requests.get(
-            f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-            headers=HEADERS,
-            params={"per_page": 100},
-        )
-        comments = resp.json() if resp.status_code == 200 else []
-        if not isinstance(comments, list):
-            comments = []
+        comments = _fetch_pr_comments_last_page(pr_number)
     except Exception as e:
-        log.error(f"Approval check for PR #{pr_number}: {e}")
+        log.debug(f"Reconcile PR #{pr_number}: {e}")
         return
 
     qa_state, sec_state = _classify_pr_reviews(comments)
 
-    def _fetch_pr():
-        try:
-            r = requests.get(pr_api_url, headers=HEADERS)
-            return r.json() if r.status_code == 200 else None
-        except Exception as e:
-            log.error(f"Fetch PR #{pr_number}: {e}")
-            return None
+    if qa_state == "approved" and sec_state == "approved":
+        dispatch_architect_merge(pr)
+        return
 
-    if qa_state == "approved" and sec_state is None:
-        pr = _fetch_pr()
-        if pr:
-            dispatch_security(pr)
-    elif qa_state == "approved" and sec_state == "approved":
-        pr = _fetch_pr()
-        if pr:
-            dispatch_architect_merge(pr)
-    else:
-        log.info(f"PR #{pr_number} — qa={qa_state}, security={sec_state}; waiting")
+    if qa_state == "changes" or sec_state == "changes":
+        last_review_time, last_fix_time = _find_last_review_and_fix(comments)
+        if last_fix_time and last_review_time and last_fix_time > last_review_time:
+            log.info(f"PR #{pr_number} — fix exists after last review, re-triggering QA")
+            state.clear_handled(f"qa-{pr_number}")
+            state.clear_handled(f"security-{pr_number}")
+            dispatch_qa(pr)
+        else:
+            dispatch_needs_fixes(pr)
+        return
+
+    if qa_state is None:
+        state.clear_handled(f"qa-{pr_number}")
+        dispatch_qa(pr)
+    elif qa_state == "approved" and sec_state is None:
+        state.clear_handled(f"security-{pr_number}")
+        dispatch_security(pr)
+
+
+def _on_review_approved(pr_number, pr_api_url):
+    """An approval landed — reconcile the PR. Thin wrapper that fetches the
+    full PR object so reconcile_pr has everything it needs."""
+    try:
+        r = requests.get(pr_api_url, headers=HEADERS)
+        if r.status_code != 200:
+            log.warning(f"Could not fetch PR #{pr_number}: HTTP {r.status_code}")
+            return
+        reconcile_pr(r.json())
+    except Exception as e:
+        log.error(f"Reconcile after approval for PR #{pr_number}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1483,109 +1535,9 @@ def poll_github():
         gh_remove_label(issue["number"], "dev-in-progress")
         gh_add_label(issue["number"], dev_label)
 
-    # Open PRs — check review state and take action
+    # Open PRs — defer to the unified reconcile_pr decision tree
     for pr in gh_get_prs("open"):
-        if pr.get("draft"):
-            continue
-        pr_number = pr["number"]
-        try:
-            # Fetch the LAST page of comments (most recent) to find latest review state.
-            # GitHub Issues Comments API always returns chronologically; use Link header
-            # to jump to the last page so we see recent reviews on heavily-commented PRs.
-            resp = requests.get(
-                f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-                headers=HEADERS,
-                params={"per_page": 100},
-            )
-            if resp.status_code != 200:
-                continue
-            link_header = resp.headers.get("Link", "")
-            if 'rel="last"' in link_header:
-                last_match = re.search(r'<([^>]+)>;\s*rel="last"', link_header)
-                if last_match:
-                    last_resp = requests.get(last_match.group(1), headers=HEADERS)
-                    if last_resp.status_code == 200:
-                        comments = last_resp.json()
-                    else:
-                        comments = resp.json()
-                else:
-                    comments = resp.json()
-            else:
-                comments = resp.json()
-
-            # Parse the LATEST state from comments (not just any comment)
-            # Look at comments in reverse to find the most recent review
-            last_qa_approved = False
-            last_sec_approved = False
-            last_changes_requested = False
-            has_qa = False
-            has_sec = False
-            for c in reversed(comments):
-                body = c.get("body", "")
-                # Skip daemon-generated comments — only trust agent-posted reviews
-                if "Daemon-verified:" in body or "Agent `" in body:
-                    continue
-                # Only check the first line (header) for verdict to avoid false positives
-                # from ✅ checkmarks in the body of CHANGES REQUESTED reviews
-                header = body.split("\n")[0] if body else ""
-                if "QA Review" in header and not has_qa:
-                    has_qa = True
-                    if "CHANGES REQUESTED" in header.upper():
-                        last_changes_requested = True
-                    else:
-                        last_qa_approved = "APPROVED" in header.upper() or "✅" in header
-                if "Security Review" in header and not has_sec:
-                    has_sec = True
-                    if "CHANGES REQUESTED" in header.upper():
-                        last_changes_requested = True
-                    else:
-                        last_sec_approved = "APPROVED" in header.upper() or "✅" in header
-
-            if last_qa_approved and last_sec_approved and not last_changes_requested:
-                # Both approved — merge
-                result = spawn_agent("architect", {
-                    "action": "merge_approved_pr",
-                    "pr_number": pr_number,
-                    "pr_title": pr["title"],
-                    "pr_body": pr.get("body", ""),
-                    "pr_url": pr.get("html_url", ""),
-                    "pr_branch": pr.get("head", {}).get("ref", ""),
-                }, pr_number)
-                if result:
-                    log.info(f"Both approved: PR #{pr_number} — merging")
-            elif last_changes_requested:
-                # Check if a dev fix was posted AFTER the last review that
-                # requested changes. If so, the fix is already applied and
-                # we should re-trigger reviewers instead of another fix cycle.
-                last_review_time = None
-                last_fix_time = None
-                for c in comments:
-                    body = c.get("body", "")
-                    header = body.split("\n")[0] if body else ""
-                    if ("QA Review" in header or "Security Review" in header) and "CHANGES REQUESTED" in header.upper():
-                        last_review_time = c.get("created_at", "")
-                    if body.startswith("## Fix iteration") or body.startswith("## Review feedback addressed"):
-                        last_fix_time = c.get("created_at", "")
-
-                if last_fix_time and last_review_time and last_fix_time > last_review_time:
-                    # Dev already fixed — re-trigger QA. Security runs after
-                    # QA approves under the sequential review flow.
-                    log.info(f"PR #{pr_number} — fix exists after last review, re-triggering QA")
-                    state.clear_handled(f"qa-{pr_number}")
-                    state.clear_handled(f"security-{pr_number}")
-                    dispatch_qa(pr)
-                else:
-                    dispatch_needs_fixes(pr)
-            else:
-                # Sequential dispatch: QA first; Security only after QA approves.
-                if not has_qa:
-                    state.clear_handled(f"qa-{pr_number}")
-                    dispatch_qa(pr)
-                elif last_qa_approved and not has_sec:
-                    state.clear_handled(f"security-{pr_number}")
-                    dispatch_security(pr)
-        except Exception as e:
-            log.debug(f"Poll PR #{pr_number}: {e}")
+        reconcile_pr(pr)
 
 
 def run_poller():
