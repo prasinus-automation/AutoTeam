@@ -168,16 +168,23 @@ ${INBOX_CONTENT}"
     fi
 fi
 
-# Append memory to system prompt
+# Memory used to be appended to the system prompt, but memory varies on
+# every run (run log grows, inbox changes, issue notes update) — that
+# invalidated the system-prompt cache on every invocation. Move memory
+# into the user message instead, so the system prompt stays stable per
+# (role, project) and benefits from prompt caching across runs.
+USER_MESSAGE="${TASK_CONTENT}"
 if [ -n "${MEMORY_CONTEXT}" ]; then
-    FULL_SYSTEM_PROMPT="${FULL_SYSTEM_PROMPT}
+    USER_MESSAGE="# Agent Memory
+
+The following is your persistent memory from previous runs. Use it to avoid repeating mistakes, build on what worked, and coordinate with other agents.
+${MEMORY_CONTEXT}
 
 ---
 
-# Agent Memory
+# Task
 
-The following is your persistent memory from previous runs. Use it to avoid repeating mistakes, build on what worked, and coordinate with other agents.
-${MEMORY_CONTEXT}"
+${TASK_CONTENT}"
 fi
 
 # ─── Run Claude Code ─────────────────────────────────────
@@ -186,8 +193,9 @@ echo "─── Starting Claude Code ──────────────�
 echo ""
 
 # Claude Code runs with:
-#   - The role-specific system prompt (+ project context from AGENTS.md + memory)
-#   - The task context
+#   - The role-specific system prompt (+ project context from AGENTS.md)
+#     — this is intentionally stable so prompt caching kicks in
+#   - The task and memory context as the user message
 #   - Access to the working directory (repo)
 #   - GitHub token for API operations
 #   - Read-write access to /memory for persisting state
@@ -197,7 +205,7 @@ echo ""
 # the usage block as a `USAGE_JSON: ...` marker line that the daemon
 # greps out of container logs for cost tracking.
 
-CLAUDE_OUTPUT=$(echo "${TASK_CONTENT}" | claude --print \
+CLAUDE_OUTPUT=$(echo "${USER_MESSAGE}" | claude --print \
     --output-format json \
     --system-prompt "${FULL_SYSTEM_PROMPT}" \
     --allowedTools "Bash,Read,Write,Edit,GitHub")
