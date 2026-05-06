@@ -191,12 +191,68 @@ echo ""
 #   - Access to the working directory (repo)
 #   - GitHub token for API operations
 #   - Read-write access to /memory for persisting state
+#
+# Use --output-format json so the final assistant text comes back wrapped
+# with usage stats. We extract the text for human-readable logs and emit
+# the usage block as a `USAGE_JSON: ...` marker line that the daemon
+# greps out of container logs for cost tracking.
 
-echo "${TASK_CONTENT}" | claude --print \
+CLAUDE_OUTPUT=$(echo "${TASK_CONTENT}" | claude --print \
+    --output-format json \
     --system-prompt "${FULL_SYSTEM_PROMPT}" \
-    --allowedTools "Bash,Read,Write,Edit,GitHub"
+    --allowedTools "Bash,Read,Write,Edit,GitHub")
 
 EXIT_CODE=$?
+
+if [ ${EXIT_CODE} -eq 0 ] && [ -n "${CLAUDE_OUTPUT}" ]; then
+    # Print the assistant result text to stdout for log readability, then
+    # emit the marker line that the daemon parses. CLAUDE_OUTPUT is passed
+    # via env so the heredoc can stay as the script source.
+    export CLAUDE_OUTPUT
+    python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("CLAUDE_OUTPUT", "")
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print(f"⚠ Failed to parse claude JSON output: {e}", file=sys.stderr)
+    sys.exit(0)
+
+result = data.get("result") or ""
+if result:
+    print(result)
+    print()
+
+usage = data.get("usage") or {}
+cost = data.get("total_cost_usd")
+duration_ms = data.get("duration_ms")
+num_turns = data.get("num_turns")
+
+summary_parts = []
+if cost is not None:
+    summary_parts.append(f"cost=${cost:.4f}")
+if usage:
+    summary_parts.append(f"in={usage.get('input_tokens', 0)}")
+    if usage.get("cache_creation_input_tokens"):
+        summary_parts.append(f"cache_create={usage['cache_creation_input_tokens']}")
+    if usage.get("cache_read_input_tokens"):
+        summary_parts.append(f"cache_read={usage['cache_read_input_tokens']}")
+    summary_parts.append(f"out={usage.get('output_tokens', 0)}")
+if num_turns is not None:
+    summary_parts.append(f"turns={num_turns}")
+if duration_ms is not None:
+    summary_parts.append(f"duration={duration_ms/1000:.1f}s")
+print(f"─── Usage: {' '.join(summary_parts)}")
+
+marker = {
+    "usage": usage,
+    "total_cost_usd": cost,
+    "duration_ms": duration_ms,
+    "num_turns": num_turns,
+}
+print(f"USAGE_JSON: {json.dumps(marker, separators=(',', ':'))}")
+PY
+fi
 
 echo ""
 echo "─── Claude Code exited: ${EXIT_CODE} ────────"

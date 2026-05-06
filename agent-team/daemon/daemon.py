@@ -309,6 +309,15 @@ class DaemonState:
         self.retry_backoff_until = {}  # "role-number" -> datetime to wait until
         self.dev_queue = []  # list of (role, issue) waiting for a slot
         self.pending_fix_prs = set()  # PR numbers whose fix dispatch was deferred
+        self.usage_totals = {  # accumulated across all agent runs since daemon start
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "runs": 0,
+        }
+        self.usage_by_role = {}  # role -> totals dict (same shape as above)
         self.lock = threading.Lock()
 
     def already_handled(self, key):
@@ -490,12 +499,75 @@ def monitor_container(container_id):
             drain_queue()
 
 
+def _extract_usage(logs_text):
+    """Parse the `USAGE_JSON: {...}` marker line emitted by agent-entrypoint
+    and return the decoded dict, or None if the marker is missing/malformed."""
+    for line in logs_text.splitlines():
+        if line.startswith("USAGE_JSON: "):
+            try:
+                return json.loads(line[len("USAGE_JSON: "):])
+            except Exception:
+                return None
+    return None
+
+
+def _record_usage(info, marker):
+    """Append a run to /logs/usage.jsonl and update in-memory totals."""
+    usage = (marker.get("usage") or {})
+    cost = marker.get("total_cost_usd") or 0.0
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "role": info["role"],
+        "number": info["number"],
+        "action": info.get("action"),
+        "input_tokens": usage.get("input_tokens", 0),
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "cost_usd": cost,
+        "duration_ms": marker.get("duration_ms"),
+        "num_turns": marker.get("num_turns"),
+    }
+    try:
+        Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+        with (Path(LOG_DIR) / "usage.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        log.warning(f"usage.jsonl write failed: {e}")
+
+    with state.lock:
+        for key in ("input_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "output_tokens"):
+            state.usage_totals[key] += record[key]
+        state.usage_totals["cost_usd"] += cost
+        state.usage_totals["runs"] += 1
+        per_role = state.usage_by_role.setdefault(info["role"], {
+            "input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "output_tokens": 0,
+            "cost_usd": 0.0, "runs": 0,
+        })
+        for key in ("input_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "output_tokens"):
+            per_role[key] += record[key]
+        per_role["cost_usd"] += cost
+        per_role["runs"] += 1
+
+
 def _handle_agent_success(info):
     log.info(f"✓ {info['name']} completed")
     retry_key = f"{info['role']}-{info['number']}"
     with state.lock:
         state.retry_counts.pop(retry_key, None)
         state.retry_backoff_until.pop(retry_key, None)
+
+    # Pull token usage from the entrypoint's USAGE_JSON marker line.
+    try:
+        logs_text = info["container"].logs(tail=20).decode("utf-8", errors="replace")
+        marker = _extract_usage(logs_text)
+        if marker:
+            _record_usage(info, marker)
+    except Exception as e:
+        log.warning(f"usage extract failed for {info['name']}: {e}")
 
     # Architect declined to merge: detect by checking if the PR is actually
     # merged after an architect-merge agent exits cleanly. If not merged, the
@@ -1121,6 +1193,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                       for v in state.active_containers.values()]
             queue_len = len(state.dev_queue)
             pending_fixes = sorted(state.pending_fix_prs)
+            usage_totals = dict(state.usage_totals)
+            usage_by_role = {k: dict(v) for k, v in state.usage_by_role.items()}
         self.wfile.write(json.dumps({
             "status": "ok",
             "mode": MODE,
@@ -1132,6 +1206,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "pending_fix_prs": pending_fixes,
             "max_total_agents": MAX_TOTAL_AGENTS,
             "credentials": _credentials_status(),
+            "usage": {
+                "since_start": usage_totals,
+                "by_role": usage_by_role,
+            },
         }).encode())
 
     def log_message(self, format, *args):
