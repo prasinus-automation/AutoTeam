@@ -526,22 +526,47 @@ def _handle_agent_success(info):
             log.error(f"Architect-decline check for PR #{pr_number}: {e}")
 
 
+def _classify_failure(logs_text):
+    """Return 'auth', 'rate_limit', or None (= not a transient failure).
+
+    Prefers the Anthropic SDK's "Error code: NNN" pattern, which is the
+    most reliable signal. Falls back to keyword matching for errors that
+    don't surface that line (CLI-level wrapping, network errors, etc.).
+    Rate-limit signals take precedence over auth signals — a 429 response
+    from an OAuth endpoint can carry auth-ish words in the body without
+    being an auth issue."""
+    sdk_match = re.search(r"error code:\s*(\d{3})", logs_text)
+    if sdk_match:
+        code = sdk_match.group(1)
+        if code == "401":
+            return "auth"
+        if code == "429":
+            return "rate_limit"
+        if code in ("500", "502", "503", "504", "529"):
+            return "rate_limit"  # upstream 5xx — same backoff treatment
+
+    # No word boundaries on these — they appear as substrings of error type
+    # names like "overloaded_error" / "rate_limit_error" where \b would miss.
+    # Each token is specific enough to not false-positive on unrelated logs.
+    if re.search(r"(rate.?limit|usage.?limit|too many requests|overloaded)", logs_text):
+        return "rate_limit"
+    if re.search(r"(authentication_error|invalid_api_key|oauth.?token.?expired|invalid authentication|unauthorized)", logs_text):
+        return "auth"
+    return None
+
+
 def _handle_agent_failure(info, container, exit_code):
     log.warning(f"✗ {info['name']} exited ({exit_code})")
 
-    is_auth_error = False
-    is_transient = False
+    failure_kind = None
     try:
         logs_text = container.logs(tail=50).decode("utf-8", errors="replace").lower()
-        is_auth_error = any(s in logs_text for s in [
-            "authentication_error", "401", "invalid authentication",
-        ])
-        is_transient = is_auth_error or any(s in logs_text for s in [
-            "rate limit", "usage limit", "too many requests",
-            "429", "overloaded", "capacity",
-        ])
+        failure_kind = _classify_failure(logs_text)
     except Exception:
         pass
+
+    is_auth_error = failure_kind == "auth"
+    is_transient = failure_kind is not None
 
     if not is_transient:
         gh_comment(info["number"],
