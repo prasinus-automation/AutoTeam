@@ -693,8 +693,25 @@ def _handle_agent_failure(info, container, exit_code):
 
     is_auth_error = failure_kind == "auth"
     is_transient = failure_kind is not None
+    is_fix_cycle = info.get("action") == "fix_review_feedback"
+
+    # A fix-cycle dispatch that failed before doing real work shouldn't burn
+    # an iteration. dispatch_needs_fixes pre-incremented state.fix_iterations
+    # at dispatch time; roll it back here regardless of whether the failure
+    # was transient. Comment-counting (the other counter source) only counts
+    # actual "address review feedback" comments, so rolling back the in-mem
+    # counter is the only thing that needs reverting.
+    if is_fix_cycle:
+        with state.lock:
+            cur = state.fix_iterations.get(info["number"], 0)
+            if cur > 0:
+                state.fix_iterations[info["number"]] = cur - 1
 
     if not is_transient:
+        # Non-transient fix-cycle failure: re-add needs-fixes so the PR
+        # doesn't get stranded label-less. Polling / next webhook can retry.
+        if is_fix_cycle:
+            gh_add_label(info["number"], "needs-fixes")
         gh_comment(info["number"],
                    f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
         return
@@ -729,7 +746,12 @@ def _handle_agent_failure(info, container, exit_code):
         return
 
     state.clear_handled(f"{info['role']}-{info['number']}")
-    if info["role"] in DEV_ROLES:
+    if is_fix_cycle:
+        # Re-add needs-fixes so the recovery poll / next webhook re-dispatches
+        # the dev once backoff expires. Without this the PR ends up label-less
+        # and orphaned, since dispatch_needs_fixes removed the label at dispatch.
+        gh_add_label(info["number"], "needs-fixes")
+    elif info["role"] in DEV_ROLES:
         gh_remove_label(info["number"], "dev-in-progress")
         gh_add_label(info["number"], info["role"])
     elif info["role"] == "architect":
