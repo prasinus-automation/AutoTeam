@@ -117,7 +117,9 @@ for label_info in \
     "backend-dev:2A7AB0:Ready for a Backend Developer agent" \
     "fullstack-dev:8E62D2:Ready for a Fullstack Developer agent (FE + BE in one slice)" \
     "dev-in-progress:1D76DB:Developer is working on this" \
-    "needs-fixes:D93F0B:PR needs fixes from review feedback"; do
+    "needs-fixes:D93F0B:PR needs fixes from review feedback" \
+    "blocked:EDEDED:Blocked on a dependency — daemon will not dispatch" \
+    "needs-attention:B60205:Daemon paused dispatch — human review required (e.g. misroute, decline loop)"; do
 
     IFS=: read -r name color desc <<< "$label_info"
     code=$(create_label "$name" "$color" "$desc")

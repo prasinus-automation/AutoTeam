@@ -49,6 +49,10 @@ MAX_FULLSTACK_AGENTS = int(os.environ.get("MAX_FULLSTACK_AGENTS", "1"))
 # Spend cap (USD) per UTC day. 0 = no cap. Once exceeded, new spawns are
 # refused until the next day rollover. In-flight agents are unaffected.
 DAILY_BUDGET_USD = float(os.environ.get("DAILY_BUDGET_USD", "0"))
+# Circuit breaker for "agent ran successfully but produced no PR" loops.
+# After this many such runs in a row for a given issue, the daemon stops
+# dispatching and adds a `needs-attention` label for human triage.
+NO_PR_RUN_LIMIT = int(os.environ.get("NO_PR_RUN_LIMIT", "2"))
 MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 MAX_TRANSIENT_RETRIES = int(os.environ.get("MAX_TRANSIENT_RETRIES", "5"))
 TRANSIENT_BACKOFF_BASE = int(os.environ.get("TRANSIENT_BACKOFF_BASE", "60"))  # seconds
@@ -330,6 +334,12 @@ class DaemonState:
             "runs": 0,
         }
         self.usage_by_role = {}  # role -> totals dict (same shape as above)
+        # Per-issue count of successful agent runs that produced no PR. Used
+        # as a circuit breaker for the case where an agent declines work
+        # (e.g., a misroute) over and over; the daemon would otherwise loop
+        # because exit 0 looks like progress while the GitHub state is still
+        # "needs work." Threshold is NO_PR_RUN_LIMIT.
+        self.no_pr_runs = {}  # issue_number -> count
         # Daily cost rollup; resets when current UTC date changes.
         self.daily_cost_usd = 0.0
         self.daily_cost_date = datetime.now(timezone.utc).date()
@@ -624,6 +634,41 @@ def _handle_agent_success(info):
     except Exception as e:
         log.warning(f"usage extract failed for {info['name']}: {e}")
 
+    # Circuit breaker: if a dev agent exits 0 without producing a PR for the
+    # assigned issue, count it. After NO_PR_RUN_LIMIT such runs, stop
+    # dispatching and label the issue `needs-attention` for human triage.
+    # This catches misroute-decline loops where the agent correctly refuses
+    # the work but the daemon's recovery keeps retrying.
+    if info["role"] in DEV_ROLES and info.get("action") == "implement_issue":
+        number = info["number"]
+        try:
+            has_pr = gh_issue_has_open_pr(number)
+        except Exception:
+            has_pr = False
+        if has_pr:
+            with state.lock:
+                state.no_pr_runs.pop(number, None)
+        else:
+            with state.lock:
+                count = state.no_pr_runs.get(number, 0) + 1
+                state.no_pr_runs[number] = count
+            if count >= NO_PR_RUN_LIMIT:
+                log.warning(
+                    f"#{number} hit no-PR run limit ({count} successful runs, no PR) "
+                    f"— escalating to needs-attention"
+                )
+                # Strip workflow labels so neither the role-label scan nor the
+                # dev-in-progress recovery scan can re-pick it up. Add
+                # needs-attention so a human notices.
+                for label in DEV_ROLES + ("dev-in-progress",):
+                    gh_remove_label(number, label)
+                gh_add_label(number, "needs-attention")
+                gh_comment(number,
+                           f"⚠️ Agent ran successfully {count} times without producing a PR. "
+                           f"Stopping the dispatch loop. See prior agent comments for the "
+                           f"reason — usually a misroute (wrong dev role for the work) or a "
+                           f"blocking dependency. Re-label manually once resolved.")
+
     # Architect-merger declined to merge: detect by checking if the PR is
     # actually merged after the agent exits cleanly. If not merged, the agent
     # chose not to (usually due to schema drift or arch concerns) — flip the
@@ -795,6 +840,11 @@ def _dispatch_dev(role, issue):
     dev-in-progress, and spawns the agent."""
     number = issue["number"]
     key = f"{role}-{number}"
+
+    # Manual triage labels — daemon stays out of the way.
+    issue_labels = {l["name"] for l in issue.get("labels", [])}
+    if "blocked" in issue_labels or "needs-attention" in issue_labels:
+        return
 
     with state.lock:
         already_queued = any(r == role and i["number"] == number for r, i in state.dev_queue)
@@ -1585,6 +1635,10 @@ def poll_github():
         for issue in gh_get_issues(label):
             number = issue["number"]
             key = f"{label}-{number}"
+            issue_labels = {l["name"] for l in issue.get("labels", [])}
+            # Skip issues that have been manually triaged out of the workflow.
+            if "blocked" in issue_labels or "needs-attention" in issue_labels:
+                continue
             with state.lock:
                 in_queue = any(r == label and i["number"] == number for r, i in state.dev_queue)
                 active_numbers = {v["number"] for v in state.active_containers.values()}
@@ -1621,6 +1675,9 @@ def poll_github():
         )
     for issue in gh_get_issues("dev-in-progress"):
         if issue.get("state") == "closed" or issue["number"] in active_numbers:
+            continue
+        issue_labels = {l["name"] for l in issue.get("labels", [])}
+        if "blocked" in issue_labels or "needs-attention" in issue_labels:
             continue
         if issue["number"] in queued_numbers or issue["number"] in pending_numbers:
             continue
