@@ -634,18 +634,42 @@ def _handle_agent_success(info):
     except Exception as e:
         log.warning(f"usage extract failed for {info['name']}: {e}")
 
-    # Circuit breaker: if a dev agent exits 0 without producing a PR for the
-    # assigned issue, count it. After NO_PR_RUN_LIMIT such runs, stop
-    # dispatching and label the issue `needs-attention` for human triage.
-    # This catches misroute-decline loops where the agent correctly refuses
-    # the work but the daemon's recovery keeps retrying.
+    # Circuit breaker: if a dev agent exits 0 without producing a PR AND
+    # without self-correcting the issue's labels, count it. After
+    # NO_PR_RUN_LIMIT such runs, escalate to `needs-attention` for human
+    # triage. The self-correction check exists so that an agent that
+    # correctly re-routed the issue (added a different dev role, `blocked`,
+    # or `needs-attention`) doesn't get overridden by the breaker — that
+    # would undo the very fix we want the agent to make.
     if info["role"] in DEV_ROLES and info.get("action") == "implement_issue":
         number = info["number"]
         try:
             has_pr = gh_issue_has_open_pr(number)
         except Exception:
             has_pr = False
-        if has_pr:
+
+        # Re-fetch issue labels AFTER the agent ran so we see any self-
+        # correction it applied (relabel to another dev role, blocked, etc.)
+        agent_acted_on_labels = False
+        try:
+            r = requests.get(
+                f"{API}/repos/{GITHUB_REPO}/issues/{number}",
+                headers=HEADERS, timeout=5,
+            )
+            if r.status_code == 200:
+                current = {l["name"] for l in (r.json().get("labels") or [])}
+                # If the issue carries a *different* dev role (re-route) or a
+                # human-triage label, the agent took meaningful action.
+                other_dev_roles = {r2 for r2 in DEV_ROLES if r2 != info["role"]}
+                agent_acted_on_labels = bool(
+                    (current & other_dev_roles)
+                    or "blocked" in current
+                    or "needs-attention" in current
+                )
+        except Exception as e:
+            log.debug(f"label re-fetch for #{number}: {e}")
+
+        if has_pr or agent_acted_on_labels:
             with state.lock:
                 state.no_pr_runs.pop(number, None)
         else:
@@ -664,10 +688,10 @@ def _handle_agent_success(info):
                     gh_remove_label(number, label)
                 gh_add_label(number, "needs-attention")
                 gh_comment(number,
-                           f"⚠️ Agent ran successfully {count} times without producing a PR. "
-                           f"Stopping the dispatch loop. See prior agent comments for the "
-                           f"reason — usually a misroute (wrong dev role for the work) or a "
-                           f"blocking dependency. Re-label manually once resolved.")
+                           f"⚠️ Agent ran successfully {count} times without producing a PR "
+                           f"or re-routing the issue. Stopping the dispatch loop. See prior "
+                           f"agent comments for the reason — usually a missing self-correction. "
+                           f"Re-label manually once resolved.")
 
     # Architect-merger declined to merge: detect by checking if the PR is
     # actually merged after the agent exits cleanly. If not merged, the agent
