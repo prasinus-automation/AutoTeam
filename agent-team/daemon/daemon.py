@@ -1233,29 +1233,50 @@ def dispatch_architect_merge(pr):
 
 def _classify_pr_reviews(comments):
     """Walk comments newest-first and return (qa_state, sec_state) where each
-    is 'approved', 'changes', or None. Only the LATEST review of each kind
-    is consulted — historical state doesn't matter once new reviews land."""
-    qa_state = None
-    sec_state = None
+    is 'approved', 'changes', or None.
+
+    Stale-verdict invalidation: a `changes` verdict is treated as None if the
+    OTHER reviewer issued an `approved` verdict more recently. The reasoning:
+    if QA approved at T2 on the latest code, a Security `changes` from T1 was
+    written against older code — the dev has since pushed a fix that QA has
+    re-reviewed and signed off on, so Security needs to re-run, not the dev.
+    Without this, a stale changes-requested verdict pins the PR in needs-fixes
+    forever despite the dev having already addressed everything."""
+    # First pass: find the latest verdict + timestamp for each reviewer.
+    # Match both "QA Review" and "QA Re-review" (some agents stylize the
+    # follow-up review with a hyphen). The regexes below allow optional
+    # "Re-" / "Re " prefixes so a stylized header still classifies.
+    qa_state = qa_ts = None
+    sec_state = sec_ts = None
+    qa_pat = re.compile(r"\bQA\s+(?:RE-?\s*)?REVIEW\b")
+    sec_pat = re.compile(r"\bSECURITY\s+(?:RE-?\s*)?REVIEW\b")
     for c in reversed(comments):
         body = c.get("body", "") or ""
-        # Skip daemon-posted notices so we never match our own headers
         if body.startswith("⚠️ Agent ") or body.startswith("⏳ Agent ") or "Daemon-verified:" in body:
             continue
         header = body.split("\n")[0]
         upper = header.upper()
-        if qa_state is None and "QA REVIEW" in upper:
+        ts = c.get("created_at", "")
+        if qa_state is None and qa_pat.search(upper):
             if "CHANGES REQUESTED" in upper:
-                qa_state = "changes"
+                qa_state, qa_ts = "changes", ts
             elif "APPROVED" in upper or "✅" in header:
-                qa_state = "approved"
-        if sec_state is None and "SECURITY REVIEW" in upper:
+                qa_state, qa_ts = "approved", ts
+        if sec_state is None and sec_pat.search(upper):
             if "CHANGES REQUESTED" in upper:
-                sec_state = "changes"
+                sec_state, sec_ts = "changes", ts
             elif "APPROVED" in upper or "✅" in header:
-                sec_state = "approved"
+                sec_state, sec_ts = "approved", ts
         if qa_state is not None and sec_state is not None:
             break
+
+    # Stale invalidation: a changes-requested verdict against older code is
+    # superseded by a more recent approval from the other reviewer.
+    if qa_state == "changes" and sec_state == "approved" and qa_ts and sec_ts and sec_ts > qa_ts:
+        qa_state = None
+    if sec_state == "changes" and qa_state == "approved" and qa_ts and sec_ts and qa_ts > sec_ts:
+        sec_state = None
+
     return qa_state, sec_state
 
 
