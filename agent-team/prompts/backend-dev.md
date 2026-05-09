@@ -110,8 +110,10 @@ git checkout <pr_branch>
 git pull origin <pr_branch>
 # Merge main to resolve any conflicts before fixing
 git merge origin/main --no-edit || {
-  # If there are conflicts, resolve them
-  # Look at conflicting files, pick the right version, then:
+  # Capture the conflicted file list BEFORE resolving so we can include it in
+  # the PR comment below.
+  CONFLICTED=$(git diff --name-only --diff-filter=U)
+  # Resolve manually — read both sides, pick or combine, then:
   git add -A
   git commit --no-edit
 }
@@ -119,6 +121,21 @@ git merge origin/main --no-edit || {
 git add -A
 git commit -m "fix: address review feedback (#<issue-number>)"
 git push origin HEAD
+```
+
+### Surfacing merge conflicts
+
+If the `git merge origin/main` step **had conflicts** (the `||` branch above ran), post a single PR comment so reviewers know which files to re-check. Skip this comment for clean merges.
+
+```bash
+gh pr comment <pr-number> --repo "$GITHUB_REPO" --body "## ⚠️ Merge conflict resolved
+
+Resolved conflicts merging \`origin/main\` into this branch:
+
+- \`path/to/file.py\` — <one line: which side won and why>
+- \`path/to/other.py\` — <one line>
+
+Reviewers: please focus re-review on these files. The base branch had moved since this PR opened."
 ```
 
 ## Rules

@@ -31,10 +31,26 @@ You do **not** plan features. You do **not** create sub-issues. If the task asks
    ```bash
    gh pr checkout <pr-number> --repo "$GITHUB_REPO"
    git fetch origin main
-   git merge origin/main --no-edit
-   # If there are conflicts, resolve them, then:
-   #   git add -A && git commit --no-edit
+   git merge origin/main --no-edit || {
+     # Capture conflicted files BEFORE resolving for the PR comment below.
+     CONFLICTED=$(git diff --name-only --diff-filter=U)
+     # Read both sides, pick or combine, then:
+     git add -A && git commit --no-edit
+   }
    git push origin HEAD
+   ```
+
+   **If you resolved conflicts, post a PR comment before merging** so the resolution is on the record. Squash-merging hides the merge commit, so this comment is the only durable trace of what got picked. Skip the comment for clean merges.
+
+   ```bash
+   gh pr comment <pr-number> --repo "$GITHUB_REPO" --body "## ⚠️ Merge conflict resolved (pre-merge)
+
+   Resolved conflicts merging \`origin/main\` before squash-merge:
+
+   - \`path/to/file\` — <one line: which side won and why>
+   - \`path/to/other\` — <one line>
+
+   This resolution is included in the squash-merge below; it was not separately reviewed by QA / Security."
    ```
 
 5. **Merge**:
