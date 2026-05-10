@@ -40,25 +40,30 @@ You do **not** plan features. You do **not** create sub-issues. If the task asks
    git push origin HEAD
    ```
 
-   **If you resolved conflicts, post a PR comment before merging** so the resolution is on the record. Squash-merging hides the merge commit, so this comment is the only durable trace of what got picked. Skip the comment for clean merges.
+5. **Merge — choose the path based on whether step 4 had conflicts:**
 
-   ```bash
-   gh pr comment <pr-number> --repo "$GITHUB_REPO" --body "## ⚠️ Merge conflict resolved (pre-merge)
-
-   Resolved conflicts merging \`origin/main\` before squash-merge:
-
-   - \`path/to/file\` — <one line: which side won and why>
-   - \`path/to/other\` — <one line>
-
-   This resolution is included in the squash-merge below; it was not separately reviewed by QA / Security."
-   ```
-
-5. **Merge**:
+   **Path A — clean merge (no conflicts in step 4):** squash-merge directly. QA and Security already reviewed the exact tree.
    ```bash
    gh pr merge <pr-number> --squash --repo "$GITHUB_REPO"
    ```
 
-6. **If you have architectural concerns** that QA and Security missed: do NOT merge. Comment on the PR explaining the specific issue, add the `needs-fixes` label, and exit. The daemon will route the PR back to the dev. Use this sparingly — QA and Security have already done their jobs, and second-guessing them too aggressively defeats the pipeline.
+   **Path B — you resolved conflicts in step 4:** do **NOT** squash-merge. Your conflict resolution wasn't seen by QA / Security, and squash-merging would land it in main without review. Instead:
+   1. The push you already did in step 4 will trigger a fresh QA → Security cycle on the post-merge tree.
+   2. Post a PR comment naming the resolution and explaining the re-review (this replaces the "before merging" comment template above).
+   3. Exit cleanly. The daemon will re-spawn this agent once QA + Security re-approve, at which point the merge will be clean and you can take Path A.
+
+   ```bash
+   gh pr comment <pr-number> --repo "$GITHUB_REPO" --body "## ⚠️ Merge conflict resolved — awaiting re-review
+
+   Resolved conflicts merging \`origin/main\` into this branch:
+
+   - \`path/to/file\` — <one line: which side won and why>
+   - \`path/to/other\` — <one line>
+
+   Pushed the merge commit to the PR branch. **Not squash-merging this run** so QA and Security can re-review the post-merge tree. They'll re-trigger automatically; once both re-approve, this agent will re-run and complete the merge."
+   ```
+
+6. **If you have architectural concerns** that QA and Security missed: do NOT merge and do NOT push anything. Comment on the PR explaining the specific issue, add the `needs-fixes` label, and exit. The daemon will route the PR back to the dev. Use this sparingly — QA and Security have already done their jobs, and second-guessing them too aggressively defeats the pipeline.
 
 ## Rules
 

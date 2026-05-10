@@ -387,7 +387,7 @@ def _dev_role_at_capacity(role):
 
 # ─── Container Management ────────────────────────────────
 
-def spawn_agent(role, task_context, issue_or_pr_number):
+def spawn_agent(role, task_context, issue_or_pr_number, extras=None):
     with state.lock:
         # Pause flag — refuse new spawns. In-flight agents continue.
         if state.paused:
@@ -493,12 +493,15 @@ def spawn_agent(role, task_context, issue_or_pr_number):
             raise
 
         with state.lock:
-            state.active_containers[container.id] = {
+            info = {
                 "role": role, "number": issue_or_pr_number,
                 "container": container, "name": container_name,
                 "started": datetime.now(timezone.utc),
                 "action": task_context.get("action"),
             }
+            if extras:
+                info.update(extras)
+            state.active_containers[container.id] = info
 
         log.info(f"✓ {container_name} started ({container.short_id})")
         threading.Thread(target=monitor_container, args=(container.id,), daemon=True).start()
@@ -693,30 +696,49 @@ def _handle_agent_success(info):
                            f"agent comments for the reason — usually a missing self-correction. "
                            f"Re-label manually once resolved.")
 
-    # Architect-merger declined to merge: detect by checking if the PR is
-    # actually merged after the agent exits cleanly. If not merged, the agent
-    # chose not to (usually due to schema drift or arch concerns) — flip the
-    # PR back into the fix loop so a dev gets re-spawned with the feedback.
+    # Architect-merger post-run handling. Three outcomes possible:
+    #   1. PR merged — happy path, nothing to do.
+    #   2. PR head SHA changed (merger pushed a commit, e.g. a conflict
+    #      resolution): treat as "awaiting re-review." The push triggers a
+    #      synchronize webhook that re-dispatches QA → Security on the
+    #      post-merge tree. Don't flip needs-fixes — the dev did nothing
+    #      wrong; the merger just brought the branch in line with main.
+    #   3. PR head unchanged AND not merged: merger declined for arch
+    #      reasons. Flip to needs-fixes (existing behavior).
     if info["role"] == "architect-merger":
         pr_number = info["number"]
+        pre_head = info.get("pre_run_head_sha")
         try:
             r = requests.get(
                 f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}",
                 headers=HEADERS,
             )
-            if r.status_code == 200 and not r.json().get("merged"):
-                log.warning(f"Architect declined to merge PR #{pr_number} — flipping to needs-fixes")
-                # Post a synthesizing CHANGES REQUESTED comment so
-                # _latest_reviews_approved() returns False on the next
-                # dispatch — otherwise the daemon would skip the fix because
-                # QA/Security previously approved.
-                gh_comment(pr_number,
-                           "## QA Review — CHANGES REQUESTED\n\n"
-                           "Re-opening review after the architect declined the merge. "
-                           "See the architect's most recent comment on this PR for the "
-                           "specific issues that need to be addressed before this can land.")
-                gh_add_label(pr_number, "needs-fixes")
-                state.clear_handled(f"merge-{pr_number}")
+            if r.status_code == 200:
+                pr_data = r.json()
+                if not pr_data.get("merged"):
+                    current_head = (pr_data.get("head") or {}).get("sha")
+                    head_changed = bool(pre_head and current_head and pre_head != current_head)
+                    if head_changed:
+                        log.info(
+                            f"Architect-merger pushed new commit on PR #{pr_number} "
+                            f"({pre_head[:7]}→{current_head[:7]}) — awaiting re-review on the post-merge tree"
+                        )
+                        # Clear merge handled so the merger can re-fire after
+                        # the synchronize-driven QA → Security cycle approves.
+                        state.clear_handled(f"merge-{pr_number}")
+                    else:
+                        log.warning(f"Architect declined to merge PR #{pr_number} — flipping to needs-fixes")
+                        # Post a synthesizing CHANGES REQUESTED comment so
+                        # _latest_reviews_approved() returns False on the next
+                        # dispatch — otherwise the daemon would skip the fix
+                        # because QA/Security previously approved.
+                        gh_comment(pr_number,
+                                   "## QA Review — CHANGES REQUESTED\n\n"
+                                   "Re-opening review after the architect declined the merge. "
+                                   "See the architect's most recent comment on this PR for the "
+                                   "specific issues that need to be addressed before this can land.")
+                        gh_add_label(pr_number, "needs-fixes")
+                        state.clear_handled(f"merge-{pr_number}")
         except Exception as e:
             log.error(f"Architect-decline check for PR #{pr_number}: {e}")
 
@@ -1218,6 +1240,10 @@ def dispatch_architect_merge(pr):
     if state.already_handled(key):
         return
 
+    # Capture the PR's head SHA at spawn time so _handle_agent_success can
+    # detect whether the merger pushed a new commit (e.g., a conflict
+    # resolution) — that case shouldn't be treated as "merger declined."
+    pre_run_head_sha = pr.get("head", {}).get("sha")
     log.info(f"Both approved: PR #{number} — spawning architect-merger")
     result = spawn_agent("architect-merger", {
         "action": "merge_approved_pr",
@@ -1226,7 +1252,7 @@ def dispatch_architect_merge(pr):
         "pr_body": pr.get("body", ""),
         "pr_url": pr.get("html_url", ""),
         "pr_branch": pr.get("head", {}).get("ref", ""),
-    }, number)
+    }, number, extras={"pre_run_head_sha": pre_run_head_sha})
     if result is None:
         state.clear_handled(key)
 
