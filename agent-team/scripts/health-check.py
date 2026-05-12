@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -549,7 +550,33 @@ def escalate_to_claude(pattern_info: dict, escalations: dict, dry_run: bool) -> 
     # working directly on the main repo lets the agent commit + push.
     # Claude is invoked in non-interactive mode and will use the gh CLI
     # already configured on the host.
-    claude_bin = os.environ.get("CLAUDE_BIN", "claude")
+    #
+    # Resolve the binary in this order:
+    #   1. CLAUDE_BIN env var (explicit override, e.g. set in crontab)
+    #   2. `claude` on PATH
+    #   3. common install paths — cron runs with a minimal PATH that
+    #      omits ~/.local/bin where npm-prefix=~/.local installs land,
+    #      so we check those explicitly before giving up.
+    claude_bin = os.environ.get("CLAUDE_BIN")
+    if not claude_bin:
+        candidates = ["claude"]
+        home = os.path.expanduser("~")
+        candidates.extend([
+            f"{home}/.local/bin/claude",
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+        ])
+        for c in candidates:
+            resolved = shutil.which(c) if "/" not in c else (c if os.path.isfile(c) and os.access(c, os.X_OK) else None)
+            if resolved:
+                claude_bin = resolved
+                break
+    if not claude_bin:
+        log.error(
+            "Claude binary not found on PATH or in common install locations. "
+            "Set CLAUDE_BIN in the crontab entry to the absolute path."
+        )
+        return
     cmd = [claude_bin, "--print", "--permission-mode", "acceptEdits", prompt]
 
     try:
