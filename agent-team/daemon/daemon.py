@@ -803,6 +803,17 @@ def _handle_agent_failure(info, container, exit_code):
         # doesn't get stranded label-less. Polling / next webhook can retry.
         if is_fix_cycle:
             gh_add_label(info["number"], "needs-fixes")
+        # Non-transient architect-merger failure: clear merge-{n} handled
+        # state so the next approval event or poll cycle can re-dispatch.
+        # Without this, an unclassified failure (e.g. claude --print
+        # exiting silently on stale credentials) strands the PR forever
+        # because `already_handled('merge-N')` keeps returning True.
+        if info["role"] == "architect-merger":
+            state.clear_handled(f"merge-{info['number']}")
+        # Same shape for architect (planner): clear architect-{n} so a
+        # later poll / re-label can retry.
+        elif info["role"] == "architect":
+            state.clear_handled(f"architect-{info['number']}")
         gh_comment(info["number"],
                    f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
         return
