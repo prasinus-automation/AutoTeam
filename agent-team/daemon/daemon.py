@@ -765,7 +765,10 @@ def _classify_failure(logs_text):
     # No word boundaries on these — they appear as substrings of error type
     # names like "overloaded_error" / "rate_limit_error" where \b would miss.
     # Each token is specific enough to not false-positive on unrelated logs.
-    if re.search(r"(rate.?limit|usage.?limit|too many requests|overloaded)", logs_text):
+    # Timeouts share rate-limit treatment because both are upstream-transient
+    # and benefit from the same exponential backoff — they're not real
+    # failures of the agent's reasoning.
+    if re.search(r"(rate.?limit|usage.?limit|too many requests|overloaded|apitimeouterror|api_timeout|read timed out|connection timed out|request timed out)", logs_text):
         return "rate_limit"
     if re.search(r"(authentication_error|invalid_api_key|oauth.?token.?expired|invalid authentication|unauthorized)", logs_text):
         return "auth"
@@ -814,6 +817,14 @@ def _handle_agent_failure(info, container, exit_code):
         # later poll / re-label can retry.
         elif info["role"] == "architect":
             state.clear_handled(f"architect-{info['number']}")
+        # Same shape for QA and security: if an unclassified failure
+        # (e.g. Anthropic API timeout that didn't match _classify_failure)
+        # leaves the PR with an "errored" comment but no real review,
+        # clear the handled flag so reconcile_pr / next synchronize webhook
+        # can re-dispatch. _classify_pr_reviews already filters the error
+        # placeholder comment, so the next attempt won't see it as a verdict.
+        elif info["role"] in ("qa", "security"):
+            state.clear_handled(f"{info['role']}-{info['number']}")
         gh_comment(info["number"],
                    f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
         return
