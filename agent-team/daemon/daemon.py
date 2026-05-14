@@ -825,6 +825,18 @@ def _handle_agent_failure(info, container, exit_code):
         # placeholder comment, so the next attempt won't see it as a verdict.
         elif info["role"] in ("qa", "security"):
             state.clear_handled(f"{info['role']}-{info['number']}")
+        # Dev `implement_issue` failure: restore the role label (so the next
+        # poll re-dispatches), drop `dev-in-progress` (so the issue isn't
+        # stranded looking active), and clear handled state (so _dispatch_dev
+        # doesn't short-circuit). Without this the issue sits with
+        # `dev-in-progress` forever — the `dev_in_progress_stale_no_pr`
+        # pattern the hourly health check has been logging. The transient
+        # retry path below already does this exact dance; the non-transient
+        # path was the missed case.
+        elif info["role"] in DEV_ROLES and not is_fix_cycle:
+            gh_remove_label(info["number"], "dev-in-progress")
+            gh_add_label(info["number"], info["role"])
+            state.clear_handled(f"{info['role']}-{info['number']}")
         gh_comment(info["number"],
                    f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
         return
