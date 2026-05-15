@@ -695,6 +695,17 @@ def _handle_agent_success(info):
                            f"or re-routing the issue. Stopping the dispatch loop. See prior "
                            f"agent comments for the reason — usually a missing self-correction. "
                            f"Re-label manually once resolved.")
+            else:
+                # Below the breaker threshold: restore the role label, drop
+                # `dev-in-progress`, and clear handled state so the next poll
+                # / webhook can re-dispatch. Without this, the issue sits
+                # with `dev-in-progress` and no active agent — the
+                # `dev_in_progress_stale_no_pr` pattern the health check has
+                # been logging. Mirrors the recovery the non-transient
+                # failure path performs.
+                gh_remove_label(number, "dev-in-progress")
+                gh_add_label(number, info["role"])
+                state.clear_handled(f"{info['role']}-{number}")
 
     # Architect-merger post-run handling. Three outcomes possible:
     #   1. PR merged — happy path, nothing to do.
