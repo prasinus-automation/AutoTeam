@@ -979,16 +979,27 @@ def _dispatch_dev(role, issue):
             return
 
     log.info(f"{role} issue: #{number} — {issue['title']}")
-    gh_remove_label(number, role)
-    gh_add_label(number, "dev-in-progress")
 
-    spawn_agent(role, {
+    # Spawn FIRST, swap labels only after the container actually starts.
+    # spawn_agent has several legitimate early-return paths (paused, daily
+    # budget hit, duplicate agent already running for this issue, active
+    # retry backoff, MAX_TOTAL_AGENTS race with a concurrent spawn, docker
+    # run exception). If any fire after we've already swapped role label →
+    # `dev-in-progress`, the issue is stranded with `dev-in-progress` and
+    # no active agent — the `dev_in_progress_stale_no_pr` pattern the
+    # hourly health check has been logging. Mirrors `dispatch_architect`.
+    result = spawn_agent(role, {
         "action": "implement_issue",
         "issue_number": number,
         "issue_title": issue["title"],
         "issue_body": issue.get("body", ""),
         "issue_url": issue.get("html_url", ""),
     }, number)
+    if result is None:
+        state.clear_handled(key)
+        return
+    gh_remove_label(number, role)
+    gh_add_label(number, "dev-in-progress")
 
 
 def dispatch_frontend_dev(issue):
