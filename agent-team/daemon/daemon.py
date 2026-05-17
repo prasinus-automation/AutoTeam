@@ -190,17 +190,28 @@ def gh_comment(issue_number, body):
 
 
 def gh_issue_has_open_pr(issue_number):
-    """Check if an issue already has an open PR (by body reference or branch name)."""
+    """Check if an issue already has an open PR (by close-keyword body reference
+    or branch name).
+
+    The body match is restricted to GitHub's auto-close keywords (closes/fixes/
+    resolves/part of) — matching any bare `#N` substring caused the recovery
+    scans and the success-path PR detection to treat unrelated mentions
+    ("Builds on #N", "See #N for context") as "this issue already has a PR,"
+    so issues stuck with `dev-in-progress` were never recovered. That kept
+    re-tripping the health check's `dev_in_progress_stale_no_pr` pattern,
+    since its own detector uses the same strict regex used here."""
     try:
+        close_re = re.compile(
+            rf'\b(?:closes|fixes|resolves|part of)\s+#{issue_number}\b',
+            re.IGNORECASE,
+        )
+        branch_re = re.compile(rf'(?:^|/){issue_number}\b')
         for pr in gh_get_prs("open"):
             pr_body = pr.get("body", "") or ""
             branch = pr.get("head", {}).get("ref", "")
-            # Check PR body for "Closes #N", "#N", etc.
-            if f"#{issue_number}" in pr_body:
+            if close_re.search(pr_body):
                 return True
-            # Check branch name for the issue number (e.g., frontend/5-slug)
-            import re
-            if re.search(rf'(?:^|/)(?:{issue_number})\b', branch):
+            if branch_re.search(branch):
                 return True
     except Exception:
         pass
