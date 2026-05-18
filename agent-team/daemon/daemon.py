@@ -65,6 +65,11 @@ MEMORY_VOLUME = f"{PROJECT_NAME}_agent-memory"
 MAX_TOTAL_AGENTS = int(os.environ.get("MAX_TOTAL_AGENTS", "3"))
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# How often (in minutes) the background loop sweeps `blocked` issues so a
+# missed unblock event (daemon down, in-memory state collision, etc.) is
+# eventually self-healed without operator intervention. The startup scan
+# always runs once regardless of this value. 0 disables the periodic sweep.
+BLOCKED_SWEEP_INTERVAL_MIN = int(os.environ.get("BLOCKED_SWEEP_INTERVAL_MIN", "30"))
 
 RESOURCE_PROFILES = {
     "architect":         {"mem_limit": "4g", "cpus": 2.0},
@@ -850,6 +855,22 @@ def _handle_agent_success(info):
         state.retry_counts.pop(retry_key, None)
         state.retry_backoff_until.pop(retry_key, None)
 
+    # Architect post-run cleanup. Two failure modes the prompt-side bash
+    # can't guard against:
+    #   1. The architect container crashes / OOMs before its trailing
+    #      `gh issue edit --remove-label architect-in-progress` step runs,
+    #      leaving the issue label-stuck under `architect-in-progress`.
+    #   2. The `architect-retriage-{N}` handled key is never cleared after
+    #      a successful re-triage run, so a *second* unblock event for the
+    #      same issue within one daemon lifetime is silently dropped.
+    # Both are idempotent: removing a label that isn't present is a no-op,
+    # and clearing an unset handled key is a no-op. Run them unconditionally
+    # for any architect-role completion regardless of `action` so a crash
+    # before action-specific branches still cleans up.
+    if info["role"] == "architect":
+        gh_remove_label(info["number"], "architect-in-progress")
+        state.clear_handled(f"architect-retriage-{info['number']}")
+
     # Pull token usage from the entrypoint's USAGE_JSON marker line.
     try:
         logs_text = info["container"].logs(tail=20).decode("utf-8", errors="replace")
@@ -1046,9 +1067,14 @@ def _handle_agent_failure(info, container, exit_code):
         if info["role"] == "architect-merger":
             state.clear_handled(f"merge-{info['number']}")
         # Same shape for architect (planner): clear architect-{n} so a
-        # later poll / re-label can retry.
+        # later poll / re-label can retry. Also clear the re-triage handled
+        # key — otherwise a subsequent unblock event for this same issue
+        # (within one daemon lifetime) is silently dropped because
+        # `state.already_handled('architect-retriage-N')` keeps returning
+        # True. The clear is idempotent if the failed run wasn't a re-triage.
         elif info["role"] == "architect":
             state.clear_handled(f"architect-{info['number']}")
+            state.clear_handled(f"architect-retriage-{info['number']}")
         # Same shape for QA and security: if an unclassified failure
         # (e.g. Anthropic API timeout that didn't match _classify_failure)
         # leaves the PR with an "errored" comment but no real review,
@@ -1112,8 +1138,23 @@ def _handle_agent_failure(info, container, exit_code):
         gh_remove_label(info["number"], "dev-in-progress")
         gh_add_label(info["number"], info["role"])
     elif info["role"] == "architect":
-        gh_remove_label(info["number"], "architect-in-progress")
-        gh_add_label(info["number"], "architect")
+        # Clear the re-triage handled key regardless of action so the
+        # recovery sweep can re-dispatch as `re_triage_unblocked` on the
+        # next poll. Keeping it set would mask the retry behind the
+        # `already_handled` check until the daemon restarts. This is
+        # idempotent if the failed run was a `plan_feature`.
+        state.clear_handled(f"architect-retriage-{info['number']}")
+        if info.get("action") == "re_triage_unblocked":
+            # Leave `architect-in-progress` set: the stuck-architect
+            # recovery sweep (which is now re-triage-aware) will detect the
+            # unblock candidate and re-dispatch via
+            # `dispatch_architect_retriage`. If we re-labeled to `architect`
+            # here, the next poll would fire `plan_feature` and lose the
+            # re-triage context (including `closed_dependencies`).
+            pass
+        else:
+            gh_remove_label(info["number"], "architect-in-progress")
+            gh_add_label(info["number"], "architect")
 
     kind = "auth" if is_auth_error else "transient"
     if retries == 1:
@@ -1270,24 +1311,60 @@ def drain_queue():
             _dispatch_dev(role, issue)
 
 
-def _try_unblock_issue(issue):
-    """If `issue` declares deps and they're all closed, strip the `blocked`
-    label and dispatch architect re-triage. Returns True if unblocked."""
-    body = issue.get("body", "") or ""
-    labels = [l["name"] for l in issue.get("labels", [])]
-    issue_number = issue["number"]
+def _is_unblock_candidate(issue):
+    """Return ``(True, sorted_closed_deps)`` if ``issue`` declares at least
+    one ``Depends on #N`` / ``Blocked by #N`` / ``After #N`` reference AND
+    every referenced #N is closed. Otherwise ``(False, [])``.
 
+    Shared by `_try_unblock_issue`, `sweep_blocked_issues`, and the
+    stuck-architect recovery sweep so we never disagree on what "unblock
+    candidate" means. Network failures fetching deps are treated as
+    "not a candidate" to stay conservative — better to skip one cycle than
+    spuriously unblock on a flaky API call.
+
+    Dep parsing goes through the module-level `_parse_dep_refs` helper per
+    the AGENTS.md "Dependency parsing — regex contract" — all four call
+    sites must share that helper (centralized in #47) so all ref shapes
+    (bare `#N`, full URL, `owner/repo#N`; same-repo only) are recognized
+    uniformly. Do not inline a regex here."""
+    body = issue.get("body", "") or ""
     depends_on = _parse_dep_refs(body)
     if not depends_on:
-        return False
+        return False, []
 
     for dep in depends_on:
         try:
             dep_issue = gh_get(f"/repos/{GITHUB_REPO}/issues/{dep}")
             if not isinstance(dep_issue, dict) or dep_issue.get("state") != "closed":
-                return False
+                return False, []
         except Exception:
-            return False
+            return False, []
+
+    return True, sorted(depends_on)
+
+
+def _try_unblock_issue(issue):
+    """If `issue` declares deps and they're all closed, strip the `blocked`
+    label and dispatch architect re-triage. Returns True if unblocked.
+
+    Safe to call multiple times: if `blocked` has already been stripped AND
+    `architect-in-progress` is already set, this is a no-op (a prior call
+    already kicked off the architect). Otherwise the dispatch is itself
+    guarded by `state.already_handled('architect-retriage-N')`."""
+    labels = [l["name"] for l in issue.get("labels", [])]
+    issue_number = issue["number"]
+
+    is_candidate, closed_deps = _is_unblock_candidate(issue)
+    if not is_candidate:
+        return False
+
+    # Re-entry guard: if a prior call already stripped `blocked` and the
+    # architect is currently working the issue, don't post a duplicate
+    # comment or re-dispatch. `_handle_agent_success` clears the handled
+    # key on completion, so a *next* unblock event after the architect
+    # finishes will still fire.
+    if "blocked" not in labels and "architect-in-progress" in labels:
+        return False
 
     if "blocked" in labels:
         gh_remove_label(issue_number, "blocked")
@@ -1297,7 +1374,7 @@ def _try_unblock_issue(issue):
             issue = refreshed
 
     log.info(f"Unblocked: #{issue_number} — dispatching architect re-triage")
-    dispatch_architect_retriage(issue, sorted(depends_on))
+    dispatch_architect_retriage(issue, closed_deps)
     return True
 
 
@@ -1328,32 +1405,70 @@ def _unblock_dependents_of(closed_issue_numbers):
 
 def sweep_blocked_issues():
     """Scan all open issues with the `blocked` label and try to unblock each.
-    Used for retroactive cleanup of issues stuck blocked from before the
-    auto-unblock logic existed."""
+
+    Three outcomes per issue:
+      - Deps declared AND all closed → strip `blocked` and dispatch architect
+        re-triage. Counts as ``unblocked``.
+      - No deps declared in the body (operator edited the body but the label
+        stuck) → strip `blocked` and post an explanatory comment, but DON'T
+        auto-dispatch — the next webhook / poll re-routes by label normally.
+        Counts as ``label_cleared``.
+      - Deps declared but at least one still open → leave the issue alone.
+        Counts as ``skipped``.
+
+    Runs on daemon start, on a configurable periodic cadence
+    (``BLOCKED_SWEEP_INTERVAL_MIN``), and on demand via ``POST /sweep-blocked``."""
     log.info("Sweeping `blocked` issues for retroactive unblock")
     unblocked = 0
+    label_cleared = 0
     skipped = 0
     try:
         resp = gh_get(f"/repos/{GITHUB_REPO}/issues",
                       params={"state": "open", "labels": "blocked", "per_page": 100})
         if not isinstance(resp, list):
             log.error(f"sweep: unexpected response listing blocked issues: {resp}")
-            return {"unblocked": 0, "skipped": 0, "error": "list failed"}
+            return {"unblocked": 0, "label_cleared": 0, "skipped": 0, "error": "list failed"}
 
         for issue in resp:
             if issue.get("pull_request"):
                 continue
-            if _try_unblock_issue(issue):
-                unblocked += 1
-            else:
-                skipped += 1
+            number = issue["number"]
+            body = issue.get("body", "") or ""
+
+            # Case 1: deps declared. Use the shared candidate check.
+            # Goes through `_parse_dep_refs` per the AGENTS.md "Dependency
+            # parsing — regex contract" so this new call site recognizes
+            # the same ref shapes as the rest of the daemon (bare `#N`,
+            # full URL, `owner/repo#N`; same-repo only).
+            depends_on = _parse_dep_refs(body)
+            if depends_on:
+                if _try_unblock_issue(issue):
+                    unblocked += 1
+                else:
+                    skipped += 1
+                continue
+
+            # Case 2: body declares no deps but the label is stuck. This
+            # happens when an operator (or the architect during re-triage)
+            # edits the body to remove `Depends on #N` but doesn't strip
+            # `blocked` — `_try_unblock_issue` returns False silently in
+            # that case, stranding the issue. Clear the label and post a
+            # human-readable note. Don't dispatch — let the next webhook /
+            # poll re-route by whatever role label the issue carries.
+            log.info(f"sweep: #{number} — `blocked` set but body declares no deps; clearing label")
+            gh_remove_label(number, "blocked")
+            gh_comment(number,
+                       "Body no longer declares dependencies; clearing `blocked`. "
+                       "If this was wrong, add the label back.")
+            label_cleared += 1
 
     except Exception as e:
         log.error(f"sweep error: {e}")
-        return {"unblocked": unblocked, "skipped": skipped, "error": str(e)}
+        return {"unblocked": unblocked, "label_cleared": label_cleared,
+                "skipped": skipped, "error": str(e)}
 
-    log.info(f"Sweep complete: {unblocked} unblocked, {skipped} skipped")
-    return {"unblocked": unblocked, "skipped": skipped}
+    log.info(f"Sweep complete: {unblocked} unblocked, {label_cleared} label-cleared, {skipped} skipped")
+    return {"unblocked": unblocked, "label_cleared": label_cleared, "skipped": skipped}
 
 
 def dispatch_dependents(pr):
@@ -2038,7 +2153,8 @@ def handle_webhook_event(event, payload):
 
 def webhook_retry_loop():
     """Background loop for webhook mode: retries agents after transient error backoff,
-    and runs a periodic safety-net poll to recover stuck issues."""
+    runs a periodic safety-net poll to recover stuck issues, and periodically
+    sweeps `blocked` issues so a missed unblock event is eventually self-healed."""
     poll_counter = 0
     while True:
         time.sleep(60)
@@ -2058,6 +2174,13 @@ def webhook_retry_loop():
                 if has_expired:
                     log.info("Retry loop: backoff expired, running poll to recover")
                 poll_github()
+
+            # Periodic blocked-sweep. The loop ticks every 60s, so
+            # `poll_counter % BLOCKED_SWEEP_INTERVAL_MIN == 0` gives a sweep
+            # every N minutes. 0 disables it.
+            if BLOCKED_SWEEP_INTERVAL_MIN > 0 and poll_counter % BLOCKED_SWEEP_INTERVAL_MIN == 0:
+                log.info(f"Periodic blocked-sweep (every {BLOCKED_SWEEP_INTERVAL_MIN}m)")
+                sweep_blocked_issues()
         except Exception as e:
             log.debug(f"Retry loop: {e}")
 
@@ -2146,15 +2269,36 @@ def poll_github():
                 state.clear_handled(key)
                 _dispatch_dev(label, issue)
 
-    # Stuck architect-in-progress issues (no agent running)
+    # Stuck architect-in-progress issues (no agent running).
+    #
+    # Two recovery paths depending on the issue body:
+    #   1. Body declares closed deps (`Depends on #N` with every #N closed) →
+    #      this is a stuck re-triage. Re-dispatch via
+    #      `dispatch_architect_retriage` so the architect re-runs against
+    #      the unblock context (with `closed_dependencies`). Adding the
+    #      `architect` label here would dispatch `plan_feature` instead
+    #      and lose the re-triage context.
+    #   2. Otherwise → stuck planner. Strip `architect-in-progress` and
+    #      add `architect` so the next poll re-dispatches as `plan_feature`.
     with state.lock:
         active_numbers = {v["number"] for v in state.active_containers.values()}
     for issue in gh_get_issues("architect-in-progress"):
         if issue.get("state") == "closed" or issue["number"] in active_numbers:
             continue
-        log.info(f"Recovering stuck architect #{issue['number']}")
-        gh_remove_label(issue["number"], "architect-in-progress")
-        gh_add_label(issue["number"], "architect")
+        number = issue["number"]
+        is_candidate, closed_deps = _is_unblock_candidate(issue)
+        if is_candidate:
+            log.info(f"Recovering stuck architect #{number} as re-triage (deps closed: {closed_deps})")
+            gh_remove_label(number, "architect-in-progress")
+            # Clear handled key before dispatching so the re-dispatch
+            # actually fires — without this, a prior in-process re-triage
+            # attempt would mask the retry.
+            state.clear_handled(f"architect-retriage-{number}")
+            dispatch_architect_retriage(issue, closed_deps)
+        else:
+            log.info(f"Recovering stuck architect #{number}")
+            gh_remove_label(number, "architect-in-progress")
+            gh_add_label(number, "architect")
 
     # Stuck dev-in-progress issues (no agent running, no open PR)
     # Re-read queued/pending state fresh since earlier dispatch calls may have
@@ -2409,6 +2553,22 @@ def main():
         log.info("✓ Scan complete")
     except Exception as e:
         log.warning(f"Initial scan failed: {e}", exc_info=True)
+
+    # Startup blocked-sweep. Catches any unblock event missed while the
+    # daemon was down (the in-memory `state.processed` set resets on
+    # restart, so without a sweep an already-stripped-but-undispatched
+    # issue stays orphaned). Run in a background thread so the HTTP server
+    # comes up promptly — an operator can hit `/pause` while a long sweep
+    # is still scanning issues.
+    def _startup_sweep():
+        try:
+            log.info("Startup blocked-sweep: scanning for issues whose deps closed while down")
+            result = sweep_blocked_issues()
+            log.info(f"Startup blocked-sweep: {result}")
+        except Exception as e:
+            log.warning(f"Startup blocked-sweep failed: {e}", exc_info=True)
+
+    threading.Thread(target=_startup_sweep, daemon=True).start()
 
     if MODE == "webhook":
         threading.Thread(target=webhook_retry_loop, daemon=True).start()

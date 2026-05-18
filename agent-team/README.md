@@ -162,3 +162,45 @@ Claude Code is mostly waiting on API calls — actual CPU usage is well under th
 - **Compute**: $0 (your box)
 - **Tunnel**: $0 (Cloudflare free)
 - **API**: $30–200/week depending on how much work you throw at it
+
+## Troubleshooting
+
+### `blocked` issues that should already be unblocked
+
+The daemon self-heals stuck `blocked` issues without operator intervention:
+
+- **On daemon start** — every project's daemon runs one blocked-sweep right
+  after its initial GitHub scan. This catches unblock events the daemon
+  missed while down (the in-memory `state.processed` set resets on restart,
+  so without the sweep an already-stripped-but-undispatched issue would
+  stay orphaned).
+- **Periodically while running** — `webhook_retry_loop` sweeps every
+  `BLOCKED_SWEEP_INTERVAL_MIN` minutes (default `30`, configurable per
+  project in `.env`; `0` disables). The startup sweep always runs even when
+  the periodic one is disabled.
+
+You normally do **not** need to call `POST /sweep-blocked` manually — the
+manual endpoint still exists for emergencies (e.g. forcing a sweep
+immediately after editing many issue bodies) but the common case is handled
+automatically.
+
+Three outcomes per swept issue:
+
+- **Unblocked** — body declares `Depends on #N` / `Blocked by #N` / `After #N`
+  AND every referenced #N is closed: the `blocked` label is stripped and
+  the architect runs `re_triage_unblocked` to decide stale / valid / revised
+  against current `main`.
+- **Label cleared** — body declares no deps but the label is stuck (operator
+  edited the body without stripping the label): the daemon strips `blocked`
+  and posts an explanatory comment, but does NOT dispatch any agent. The
+  next webhook / poll re-routes by whatever role label the issue carries.
+- **Skipped** — deps declared but at least one is still open: left alone.
+
+### Stuck `architect-in-progress` issues
+
+The recovery sweep at the bottom of `poll_github` (also runs every poll
+cycle in webhook mode via the 5-minute safety-net poll) detects
+`architect-in-progress` issues with no active container and re-dispatches
+them. If the issue body declares closed deps it re-dispatches as
+`re_triage_unblocked` (preserving the unblock context); otherwise it
+re-labels to `architect` so a fresh `plan_feature` runs.
