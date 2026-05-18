@@ -80,6 +80,14 @@ If neither applies, proceed with the workflow below.
    ```
 
 10. **Open a PR**:
+   The first line of the body MUST be exactly `Closes #<issue-number>`. The
+   daemon's broadened link detection (`agent-team/daemon/daemon.py` —
+   `_parse_pr_close_refs`) also accepts `Fixes`, `Resolves`, `Implements`,
+   `Completes`, `Part of`, etc., plus URL and `owner/repo#N` forms, but
+   `Closes #N` is the canonical form — it's what GitHub's UI uses to render
+   the "Linked issues" sidebar and what triggers auto-close on merge. Stick
+   with it.
+
    ```bash
    gh pr create \
      --title "feat: <description>" \

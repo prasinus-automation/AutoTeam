@@ -321,6 +321,218 @@ def gh_check_both_approved(pr_number):
     return qa_approved and security_approved
 
 
+# ─── Dependency / PR-close link parsing ──────────────────
+#
+# Two related concerns, both expressed in GitHub Markdown bodies:
+#
+#   * Issue→issue dependency:  "Depends on #N" / "Blocked by #N" / "After #N"
+#     in an issue body declares that #N must close before this issue can
+#     proceed. Devs add the `blocked` label when they see one of these and
+#     the daemon strips it via _try_unblock_issue when all deps close.
+#
+#   * PR→issue closure:        "Closes #N" / "Fixes #N" / "Resolves #N" /
+#     "Part of #N" / "Implements #N" / "Completes #N" / etc. in a PR body
+#     declares that merging the PR resolves issue #N. dispatch_dependents
+#     uses this to route unblocked dependents to architect re-triage.
+#
+# Both forms accept three ref shapes (case-insensitive):
+#
+#   1. Bare:        #N
+#   2. Full URL:    https://github.com/<owner>/<repo>/issues/N
+#   3. Owner/repo:  <owner>/<repo>#N
+#
+# Only same-repo refs count — cross-repo references are silently dropped
+# because the daemon has no auth into other repos and dependents are
+# intentionally scoped to this repo.
+#
+# All four call sites (_try_unblock_issue, _unblock_dependents_of,
+# dispatch_dependents, _derive_dev_role_for_pr) MUST go through the parser
+# functions below — duplicating the regex inline was the original source of
+# issue #38 (keywords drifting between sites).
+
+_DEP_KEYWORDS = r'(?:depends on|blocked by|after)'
+
+# PR-close keyword set. GitHub's built-in close-on-merge handles a narrower
+# subset (closes/fixes/resolves + plurals), but PR authors in this repo also
+# use 'implements', 'completes', 'part of', and 'closed-by'. Broadening
+# unblock detection makes the system forgiving of variants while the canonical
+# form for new PRs remains "Closes #N" (see dev prompts).
+_PR_CLOSE_KEYWORDS = (
+    r'(?:'
+    r'closes|closed|close|'
+    r'fixes|fixed|fix|'
+    r'resolves|resolved|resolve|'
+    r'part of|implements|completes|closed-by'
+    r')'
+)
+
+DEP_BARE_RE = re.compile(rf'\b{_DEP_KEYWORDS}\s+#(\d+)\b', re.IGNORECASE)
+PR_CLOSE_BARE_RE = re.compile(rf'\b{_PR_CLOSE_KEYWORDS}\s+#(\d+)\b', re.IGNORECASE)
+
+# URL and owner/repo regex variants — built from GITHUB_REPO so they only
+# match same-repo refs. Cross-repo refs are intentionally never parsed.
+_GH_REPO_ESC = re.escape(GITHUB_REPO)
+
+DEP_URL_RE = re.compile(
+    rf'\b{_DEP_KEYWORDS}\s+https?://github\.com/{_GH_REPO_ESC}/issues/(\d+)\b',
+    re.IGNORECASE,
+)
+DEP_OWNER_REPO_RE = re.compile(
+    rf'\b{_DEP_KEYWORDS}\s+{_GH_REPO_ESC}#(\d+)\b',
+    re.IGNORECASE,
+)
+PR_CLOSE_URL_RE = re.compile(
+    rf'\b{_PR_CLOSE_KEYWORDS}\s+https?://github\.com/{_GH_REPO_ESC}/issues/(\d+)\b',
+    re.IGNORECASE,
+)
+PR_CLOSE_OWNER_REPO_RE = re.compile(
+    rf'\b{_PR_CLOSE_KEYWORDS}\s+{_GH_REPO_ESC}#(\d+)\b',
+    re.IGNORECASE,
+)
+
+# Branch-name fallback for PRs: frontend/N-..., backend/N-..., fullstack/N-...
+# infer N as the closed issue when the body yields nothing. The dev
+# branch-naming convention is documented in AGENTS.md.
+BRANCH_ISSUE_NUM_RE = re.compile(r'^(?:frontend|backend|fullstack)/(\d+)-')
+
+
+def _parse_dep_refs(body):
+    """Parse an issue body for dependency refs (Depends on / Blocked by /
+    After). Returns the set of same-repo issue numbers referenced.
+    Cross-repo refs are silently dropped."""
+    if not body:
+        return set()
+    nums = set()
+    for rx in (DEP_BARE_RE, DEP_URL_RE, DEP_OWNER_REPO_RE):
+        nums.update(int(n) for n in rx.findall(body))
+    return nums
+
+
+def _parse_pr_close_refs_from_body(body):
+    """Parse a PR body for close-keyword refs (Closes / Fixes / Resolves /
+    Part of / Implements / Completes / Closed-by / ...). Returns the set of
+    same-repo issue numbers. Cross-repo refs are silently dropped."""
+    if not body:
+        return set()
+    nums = set()
+    for rx in (PR_CLOSE_BARE_RE, PR_CLOSE_URL_RE, PR_CLOSE_OWNER_REPO_RE):
+        nums.update(int(n) for n in rx.findall(body))
+    return nums
+
+
+def _parse_issue_num_from_branch(branch):
+    """Return the issue number embedded in a role-prefixed branch name
+    (frontend/12-foo, backend/7-bar, fullstack/3-baz), or None."""
+    if not branch:
+        return None
+    m = BRANCH_ISSUE_NUM_RE.match(branch)
+    return int(m.group(1)) if m else None
+
+
+def _fetch_github_linked_issues(pr_number):
+    """Best-effort fallback: ask the GitHub GraphQL API which issues a PR is
+    set to close. This catches PRs that were linked via GitHub's UI sidebar
+    rather than a body keyword. Returns a set of same-repo issue numbers
+    (cross-repo silently dropped), or an empty set on any failure — this
+    path must NEVER raise into the unblock pipeline."""
+    try:
+        owner, repo = GITHUB_REPO.split("/", 1)
+    except ValueError:
+        return set()
+    query = (
+        "query($owner: String!, $repo: String!, $number: Int!) {"
+        " repository(owner: $owner, name: $repo) {"
+        "  pullRequest(number: $number) {"
+        "   closingIssuesReferences(first: 50) {"
+        "    nodes { number repository { nameWithOwner } }"
+        "   }"
+        "  }"
+        " }"
+        "}"
+    )
+    try:
+        resp = requests.post(
+            f"{API}/graphql",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+            json={"query": query, "variables": {
+                "owner": owner, "repo": repo, "number": pr_number,
+            }},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.warning(
+                f"linked-issues fallback: GraphQL returned "
+                f"{resp.status_code} for PR #{pr_number}"
+            )
+            return set()
+        data = resp.json()
+        nodes = ((data.get("data") or {})
+                 .get("repository", {})
+                 .get("pullRequest", {})
+                 .get("closingIssuesReferences", {})
+                 .get("nodes") or [])
+        same_repo = f"{owner}/{repo}".lower()
+        nums = set()
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            n_repo = (node.get("repository") or {}).get("nameWithOwner", "")
+            if n_repo.lower() != same_repo:
+                continue
+            try:
+                nums.add(int(node["number"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return nums
+    except Exception as e:
+        log.warning(
+            f"linked-issues fallback: GraphQL call failed "
+            f"for PR #{pr_number}: {e}"
+        )
+        return set()
+
+
+def _parse_pr_close_refs(pr):
+    """Resolve the set of same-repo issue numbers a PR closes.
+
+    Tries, in order:
+      1. PR body close-keyword refs (bare #N, URL form, owner/repo#N).
+      2. Branch-name fallback (frontend/N-..., backend/N-..., fullstack/N-...).
+      3. Best-effort GitHub linked-issues lookup (GraphQL
+         `closingIssuesReferences`).
+
+    Returns a set of ints (possibly empty). The branch-name and GraphQL
+    fallbacks log explicitly so the source of the inference is auditable."""
+    body = pr.get("body", "") or ""
+    nums = _parse_pr_close_refs_from_body(body)
+    if nums:
+        return nums
+
+    branch = (pr.get("head") or {}).get("ref", "") or ""
+    branch_num = _parse_issue_num_from_branch(branch)
+    if branch_num is not None:
+        log.info(
+            f"PR #{pr.get('number')}: no body close-link; inferring closed "
+            f"issue from branch name '{branch}' → #{branch_num}"
+        )
+        return {branch_num}
+
+    pr_number = pr.get("number")
+    if pr_number is not None:
+        linked = _fetch_github_linked_issues(pr_number)
+        if linked:
+            log.info(
+                f"PR #{pr_number}: no body close-link or branch hint; "
+                f"GitHub linked-issues sidebar reports {sorted(linked)}"
+            )
+            return linked
+
+    return set()
+
+
 # ─── State ───────────────────────────────────────────────
 
 class DaemonState:
@@ -1065,9 +1277,7 @@ def _try_unblock_issue(issue):
     labels = [l["name"] for l in issue.get("labels", [])]
     issue_number = issue["number"]
 
-    depends_on = set(int(n) for n in re.findall(
-        r'(?:depends on|blocked by|after)\s+#(\d+)', body, re.IGNORECASE
-    ))
+    depends_on = _parse_dep_refs(body)
     if not depends_on:
         return False
 
@@ -1106,9 +1316,7 @@ def _unblock_dependents_of(closed_issue_numbers):
                 continue  # skip PRs
             body = issue.get("body", "") or ""
 
-            depends_on = set(int(n) for n in re.findall(
-                r'(?:depends on|blocked by|after)\s+#(\d+)', body, re.IGNORECASE
-            ))
+            depends_on = _parse_dep_refs(body)
             if not depends_on.intersection(closed_issue_numbers):
                 continue
 
@@ -1149,18 +1357,25 @@ def sweep_blocked_issues():
 
 
 def dispatch_dependents(pr):
-    """When a PR is merged, find issues that depended on it and trigger them."""
-    pr_number = pr["number"]
-    pr_body = pr.get("body", "") or ""
+    """When a PR is merged, find issues that depended on it and trigger them.
 
-    # Find which issue this PR closed (e.g. "Closes #2", "Fixes #2", "Part of #1")
-    closed_issues = set(int(n) for n in re.findall(
-        r'(?:closes|fixes|resolves|part of)\s+#(\d+)', pr_body, re.IGNORECASE
-    ))
+    Detection sources, in priority order (see _parse_pr_close_refs):
+      1. PR body close-keyword refs — bare `#N`, full URL, `owner/repo#N`.
+      2. Branch-name fallback — `<role>/<N>-...`.
+      3. Best-effort GraphQL `closingIssuesReferences` lookup.
+
+    A miss here means dependents stay `blocked` forever, so the layered
+    fallback is intentional (see #38 / #45)."""
+    pr_number = pr["number"]
+    closed_issues = _parse_pr_close_refs(pr)
     if not closed_issues:
+        log.info(
+            f"PR #{pr_number} merged but no closed-issue link detected "
+            f"(body, branch, or GitHub sidebar). Skipping dependent unblock."
+        )
         return
 
-    log.info(f"PR #{pr_number} merged, closed issues: {closed_issues}")
+    log.info(f"PR #{pr_number} merged, closed issues: {sorted(closed_issues)}")
     _unblock_dependents_of(closed_issues)
 
 
@@ -1290,9 +1505,10 @@ def _derive_dev_role_for_pr(pr):
             return role
 
     body = pr.get("body", "") or ""
-    linked = {int(n) for n in re.findall(
-        r'(?:closes|fixes|resolves|part of)\s+#(\d+)', body, re.IGNORECASE
-    )}
+    # Body-only parser here (not _parse_pr_close_refs): the branch / GraphQL
+    # fallbacks live one level up and we don't want a re-spawn path triggering
+    # extra GraphQL calls during webhook handling.
+    linked = _parse_pr_close_refs_from_body(body)
     for issue_number in linked:
         try:
             issue = gh_get(f"/repos/{GITHUB_REPO}/issues/{issue_number}")
