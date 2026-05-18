@@ -118,15 +118,41 @@ If you add tests, prefer `pytest` (not yet a dep) and keep them in `agent-team/d
 - `blocked` is automatic; `needs-attention` is manual triage that the daemon never touches.
 
 ### Dependency parsing — regex contract
-The daemon parses these phrases (case-insensitive) from **issue bodies**:
-```
-(?:depends on|blocked by|after)\s+#(\d+)
-```
-And these from **PR bodies**:
-```
-(?:closes|fixes|resolves|part of)\s+#(\d+)
-```
-Currently only same-repo bare-number refs (`#123`) match. Full-URL refs, cross-repo `owner/repo#N` refs, and other keywords (`implements`, `completes`) do **not** match — if you change this contract, update all four call sites: `_try_unblock_issue`, `_unblock_dependents_of`, `dispatch_dependents`, and the dev prompts.
+The daemon parses dependency/close keywords from issue and PR bodies via the
+helpers `_parse_dep_refs`, `_parse_pr_close_refs_from_body`, and
+`_parse_pr_close_refs` in `daemon.py`. The four call sites
+(`_try_unblock_issue`, `_unblock_dependents_of`, `dispatch_dependents`,
+`_derive_dev_role_for_pr`) MUST go through those helpers — duplicating the
+regex inline was the original source of issue #38.
+
+**Keyword sets (case-insensitive):**
+
+- **Issue bodies (dependency):** `depends on`, `blocked by`, `after`
+- **PR bodies (close):** `closes`, `close`, `closed`, `fixes`, `fix`, `fixed`,
+  `resolves`, `resolve`, `resolved`, `part of`, `implements`, `completes`,
+  `closed-by`
+
+**Ref shapes accepted (both sets):**
+
+1. Bare:        `#N`
+2. Full URL:    `https://github.com/<owner>/<repo>/issues/N`
+3. Owner/repo:  `<owner>/<repo>#N`
+
+Only **same-repo** refs match — cross-repo references (`other-owner/repo#N`
+or full-URL equivalents) are silently dropped because the daemon has no
+auth into other repos.
+
+**Branch-name fallback (PR side only):** if the PR body has no close-link,
+`_parse_pr_close_refs` falls back to parsing `frontend/<N>-...`,
+`backend/<N>-...`, or `fullstack/<N>-...` from the PR head ref.
+
+**GraphQL fallback (PR side only):** as a final fallback, the daemon queries
+GitHub's GraphQL `closingIssuesReferences` field via `_fetch_github_linked_issues`
+so PRs linked via the UI sidebar (without any body keyword) are still
+detected. Wrapped in try/except — must never raise into the unblock pipeline.
+
+If you change any of the above, update the regression tests at
+`agent-team/daemon/tests/test_regex.py` and the dev-prompt wording.
 
 ### Branch naming
 Devs create branches with role-prefixes: `frontend/<issue>-<slug>`, `backend/<issue>-<slug>`, `fullstack/<issue>-<slug>`. The daemon uses the prefix to decide which dev to re-spawn for `needs-fixes`.
