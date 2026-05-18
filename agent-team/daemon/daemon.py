@@ -190,17 +190,27 @@ def gh_comment(issue_number, body):
 
 
 def gh_issue_has_open_pr(issue_number):
-    """Check if an issue already has an open PR (by body reference or branch name)."""
+    """Check if an issue already has an open PR.
+
+    Body match requires a closing keyword (`Closes/Fixes/Resolves/Part of #N`)
+    — what our dev prompts require in every PR. A bare substring check
+    (`f"#{N}" in pr_body`) false-positives on `#1050` for issue `#105` and
+    on casual cross-references like "see #105 for context", which silently
+    suppresses the dev-in-progress recovery scan below and leaves issues
+    stuck under `dev-in-progress` indefinitely.
+    """
+    body_re = re.compile(
+        rf"\b(?:closes|fixes|resolves|part of)\s+#{issue_number}\b",
+        re.IGNORECASE,
+    )
+    branch_re = re.compile(rf"(?:^|/){issue_number}\b")
     try:
         for pr in gh_get_prs("open"):
             pr_body = pr.get("body", "") or ""
             branch = pr.get("head", {}).get("ref", "")
-            # Check PR body for "Closes #N", "#N", etc.
-            if f"#{issue_number}" in pr_body:
+            if body_re.search(pr_body):
                 return True
-            # Check branch name for the issue number (e.g., frontend/5-slug)
-            import re
-            if re.search(rf'(?:^|/)(?:{issue_number})\b', branch):
+            if branch_re.search(branch):
                 return True
     except Exception:
         pass
@@ -836,6 +846,18 @@ def _handle_agent_failure(info, container, exit_code):
         # placeholder comment, so the next attempt won't see it as a verdict.
         elif info["role"] in ("qa", "security"):
             state.clear_handled(f"{info['role']}-{info['number']}")
+        # Dev `implement_issue` failure: restore the role label (so the next
+        # poll re-dispatches), drop `dev-in-progress` (so the issue isn't
+        # stranded looking active), and clear handled state (so _dispatch_dev
+        # doesn't short-circuit). Without this the issue sits with
+        # `dev-in-progress` forever — the `dev_in_progress_stale_no_pr`
+        # pattern the hourly health check has been logging. The transient
+        # retry path below already does this exact dance; the non-transient
+        # path was the missed case.
+        elif info["role"] in DEV_ROLES and not is_fix_cycle:
+            gh_remove_label(info["number"], "dev-in-progress")
+            gh_add_label(info["number"], info["role"])
+            state.clear_handled(f"{info['role']}-{info['number']}")
         gh_comment(info["number"],
                    f"⚠️ Agent `{info['role']}` errored (exit {exit_code}). Check daemon logs.")
         return
@@ -913,6 +935,31 @@ def dispatch_architect(issue):
     gh_add_label(number, "architect-in-progress")
 
 
+def dispatch_architect_retriage(issue, closed_deps):
+    """Re-triage an issue whose blocking deps just resolved. The architect
+    decides whether the issue is still relevant against current `main` and
+    either closes it as stale, edits the body, or re-labels with a dev role."""
+    number = issue["number"]
+    key = f"architect-retriage-{number}"
+    if state.already_handled(key):
+        return
+
+    log.info(f"Architect re-triage: #{number} — {issue['title']} (deps closed: {closed_deps})")
+
+    result = spawn_agent("architect", {
+        "action": "re_triage_unblocked",
+        "issue_number": number,
+        "issue_title": issue["title"],
+        "issue_body": issue.get("body", ""),
+        "issue_url": issue.get("html_url", ""),
+        "closed_dependencies": closed_deps,
+    }, number)
+    if result is None:
+        state.clear_handled(key)
+        return
+    gh_add_label(number, "architect-in-progress")
+
+
 def _dispatch_dev(role, issue):
     """Generic dev dispatcher used by frontend / backend / fullstack roles.
     Queues if at per-role capacity; otherwise removes the role label, adds
@@ -943,16 +990,27 @@ def _dispatch_dev(role, issue):
             return
 
     log.info(f"{role} issue: #{number} — {issue['title']}")
-    gh_remove_label(number, role)
-    gh_add_label(number, "dev-in-progress")
 
-    spawn_agent(role, {
+    # Spawn FIRST, swap labels only after the container actually starts.
+    # spawn_agent has several legitimate early-return paths (paused, daily
+    # budget hit, duplicate agent already running for this issue, active
+    # retry backoff, MAX_TOTAL_AGENTS race with a concurrent spawn, docker
+    # run exception). If any fire after we've already swapped role label →
+    # `dev-in-progress`, the issue is stranded with `dev-in-progress` and
+    # no active agent — the `dev_in_progress_stale_no_pr` pattern the
+    # hourly health check has been logging. Mirrors `dispatch_architect`.
+    result = spawn_agent(role, {
         "action": "implement_issue",
         "issue_number": number,
         "issue_title": issue["title"],
         "issue_body": issue.get("body", ""),
         "issue_url": issue.get("html_url", ""),
     }, number)
+    if result is None:
+        state.clear_handled(key)
+        return
+    gh_remove_label(number, role)
+    gh_add_label(number, "dev-in-progress")
 
 
 def dispatch_frontend_dev(issue):
@@ -1001,22 +1059,44 @@ def drain_queue():
             _dispatch_dev(role, issue)
 
 
-def dispatch_dependents(pr):
-    """When a PR is merged, find issues that depended on it and trigger them."""
-    pr_number = pr["number"]
-    pr_body = pr.get("body", "") or ""
+def _try_unblock_issue(issue):
+    """If `issue` declares deps and they're all closed, strip the `blocked`
+    label and dispatch architect re-triage. Returns True if unblocked."""
+    body = issue.get("body", "") or ""
+    labels = [l["name"] for l in issue.get("labels", [])]
+    issue_number = issue["number"]
 
-    # Find which issue this PR closed (e.g. "Closes #2", "Fixes #2", "Part of #1")
-    import re
-    closed_issues = set(int(n) for n in re.findall(
-        r'(?:closes|fixes|resolves|part of)\s+#(\d+)', pr_body, re.IGNORECASE
+    depends_on = set(int(n) for n in re.findall(
+        r'(?:depends on|blocked by|after)\s+#(\d+)', body, re.IGNORECASE
     ))
-    if not closed_issues:
+    if not depends_on:
+        return False
+
+    for dep in depends_on:
+        try:
+            dep_issue = gh_get(f"/repos/{GITHUB_REPO}/issues/{dep}")
+            if not isinstance(dep_issue, dict) or dep_issue.get("state") != "closed":
+                return False
+        except Exception:
+            return False
+
+    if "blocked" in labels:
+        gh_remove_label(issue_number, "blocked")
+        gh_comment(issue_number, "Unblocked — all referenced dependencies are closed. Routing to architect for staleness check.")
+        refreshed = gh_get(f"/repos/{GITHUB_REPO}/issues/{issue_number}")
+        if isinstance(refreshed, dict):
+            issue = refreshed
+
+    log.info(f"Unblocked: #{issue_number} — dispatching architect re-triage")
+    dispatch_architect_retriage(issue, sorted(depends_on))
+    return True
+
+
+def _unblock_dependents_of(closed_issue_numbers):
+    """Scan open issues for ones that depend on any of `closed_issue_numbers`.
+    If all of their declared deps are now closed, route them to architect re-triage."""
+    if not closed_issue_numbers:
         return
-
-    log.info(f"PR #{pr_number} merged, closed issues: {closed_issues}")
-
-    # Scan open issues for ones that depend on the closed issues
     try:
         resp = gh_get(f"/repos/{GITHUB_REPO}/issues", params={"state": "open", "per_page": 100})
         if not isinstance(resp, list):
@@ -1026,43 +1106,63 @@ def dispatch_dependents(pr):
             if issue.get("pull_request"):
                 continue  # skip PRs
             body = issue.get("body", "") or ""
-            labels = [l["name"] for l in issue.get("labels", [])]
 
-            # Check if this issue depends on any of the closed issues
             depends_on = set(int(n) for n in re.findall(
                 r'(?:depends on|blocked by|after)\s+#(\d+)', body, re.IGNORECASE
             ))
-            if not depends_on.intersection(closed_issues):
+            if not depends_on.intersection(closed_issue_numbers):
                 continue
 
-            # Check if all dependencies are now resolved (closed)
-            all_resolved = True
-            for dep in depends_on:
-                try:
-                    dep_issue = gh_get(f"/repos/{GITHUB_REPO}/issues/{dep}")
-                    if dep_issue.get("state") != "closed":
-                        all_resolved = False
-                        break
-                except Exception:
-                    all_resolved = False
-                    break
-
-            if not all_resolved:
-                log.info(f"Issue #{issue['number']} still has unresolved dependencies")
-                continue
-
-            # Trigger the appropriate dev agent
-            issue_number = issue["number"]
-            for dev_role in DEV_ROLES:
-                if dev_role in labels:
-                    log.info(f"Unblocked: #{issue_number} — dispatching {dev_role}")
-                    _dispatch_dev(dev_role, issue)
-                    break
-            else:
-                log.info(f"Unblocked: #{issue_number} — no dev label, skipping")
+            _try_unblock_issue(issue)
 
     except Exception as e:
         log.error(f"Error checking dependents: {e}")
+
+
+def sweep_blocked_issues():
+    """Scan all open issues with the `blocked` label and try to unblock each.
+    Used for retroactive cleanup of issues stuck blocked from before the
+    auto-unblock logic existed."""
+    log.info("Sweeping `blocked` issues for retroactive unblock")
+    unblocked = 0
+    skipped = 0
+    try:
+        resp = gh_get(f"/repos/{GITHUB_REPO}/issues",
+                      params={"state": "open", "labels": "blocked", "per_page": 100})
+        if not isinstance(resp, list):
+            log.error(f"sweep: unexpected response listing blocked issues: {resp}")
+            return {"unblocked": 0, "skipped": 0, "error": "list failed"}
+
+        for issue in resp:
+            if issue.get("pull_request"):
+                continue
+            if _try_unblock_issue(issue):
+                unblocked += 1
+            else:
+                skipped += 1
+
+    except Exception as e:
+        log.error(f"sweep error: {e}")
+        return {"unblocked": unblocked, "skipped": skipped, "error": str(e)}
+
+    log.info(f"Sweep complete: {unblocked} unblocked, {skipped} skipped")
+    return {"unblocked": unblocked, "skipped": skipped}
+
+
+def dispatch_dependents(pr):
+    """When a PR is merged, find issues that depended on it and trigger them."""
+    pr_number = pr["number"]
+    pr_body = pr.get("body", "") or ""
+
+    # Find which issue this PR closed (e.g. "Closes #2", "Fixes #2", "Part of #1")
+    closed_issues = set(int(n) for n in re.findall(
+        r'(?:closes|fixes|resolves|part of)\s+#(\d+)', pr_body, re.IGNORECASE
+    ))
+    if not closed_issues:
+        return
+
+    log.info(f"PR #{pr_number} merged, closed issues: {closed_issues}")
+    _unblock_dependents_of(closed_issues)
 
 
 def dispatch_qa(pr):
@@ -1164,20 +1264,69 @@ def _latest_reviews_approved(pr_number):
         return False
 
 
+_BRANCH_PREFIX_ROLE = {
+    "frontend/": "frontend-dev",
+    "backend/": "backend-dev",
+    "fullstack/": "fullstack-dev",
+}
+
+
+def _derive_dev_role_for_pr(pr):
+    """Determine which dev role owns a PR.
+
+    Primary signal is the branch prefix (frontend/, backend/, fullstack/).
+    When the branch was named off-convention (e.g. feat/foo), fall back to
+    the PR's own dev-role labels, then to the linked issue's labels parsed
+    from the PR body ("Closes #N" / "Fixes #N" / "Resolves #N" / "Part of #N").
+    Returns the role string or None if nothing matched.
+    """
+    branch = pr.get("head", {}).get("ref", "") or ""
+    for prefix, role in _BRANCH_PREFIX_ROLE.items():
+        if branch.startswith(prefix):
+            return role
+
+    pr_labels = {l["name"] for l in pr.get("labels", []) if isinstance(l, dict)}
+    for role in DEV_ROLES:
+        if role in pr_labels:
+            return role
+
+    body = pr.get("body", "") or ""
+    linked = {int(n) for n in re.findall(
+        r'(?:closes|fixes|resolves|part of)\s+#(\d+)', body, re.IGNORECASE
+    )}
+    for issue_number in linked:
+        try:
+            issue = gh_get(f"/repos/{GITHUB_REPO}/issues/{issue_number}")
+        except Exception:
+            continue
+        issue_labels = {l["name"] for l in issue.get("labels", []) if isinstance(l, dict)}
+        for role in DEV_ROLES:
+            if role in issue_labels:
+                return role
+    return None
+
+
 def dispatch_needs_fixes(pr):
     """Re-spawn the right dev agent with review feedback context."""
     number = pr["number"]
     branch = pr.get("head", {}).get("ref", "")
 
-    # Determine dev type from branch prefix
-    if branch.startswith("frontend/"):
-        dev_role = "frontend-dev"
-    elif branch.startswith("backend/"):
-        dev_role = "backend-dev"
-    elif branch.startswith("fullstack/"):
-        dev_role = "fullstack-dev"
-    else:
-        log.warning(f"PR #{number} branch '{branch}' has no frontend/, backend/, or fullstack/ prefix — skipping")
+    dev_role = _derive_dev_role_for_pr(pr)
+    if dev_role is None:
+        key = f"unknown-role-{number}"
+        if not state.already_handled(key):
+            log.warning(
+                f"PR #{number} branch '{branch}' has no role prefix and no role label "
+                f"on PR or linked issue — flagging for human triage"
+            )
+            gh_comment(number,
+                       "⚠️ Cannot determine which dev role owns this PR. "
+                       "Branch is not prefixed with `frontend/`, `backend/`, or `fullstack/`, "
+                       "and no dev-role label was found on the PR or linked issue. "
+                       "Add a `frontend-dev`, `backend-dev`, or `fullstack-dev` label "
+                       "to this PR (or rename the branch) so the fix loop can resume.")
+            gh_remove_label(number, "needs-fixes")
+            gh_add_label(number, "needs-attention")
         return
 
     # If the latest reviews are both approvals, the fix is already applied — skip
@@ -1467,6 +1616,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"paused": state.paused}).encode())
             return
 
+        # /sweep-blocked is a retroactive-cleanup endpoint: scans every open
+        # issue with the `blocked` label and routes the resolved ones through
+        # architect re-triage. HMAC-protected with the same WEBHOOK_SECRET.
+        if self.path == "/sweep-blocked":
+            signature = self.headers.get("X-Hub-Signature-256", "")
+            expected = "sha256=" + hmac.new(
+                WEBHOOK_SECRET.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"started": true}')
+            threading.Thread(target=sweep_blocked_issues, daemon=True).start()
+            return
+
         # WEBHOOK_SECRET is required at startup in webhook mode (see main),
         # so signature verification is unconditional here.
         signature = self.headers.get("X-Hub-Signature-256", "")
@@ -1580,6 +1748,13 @@ def handle_webhook_event(event, payload):
         pr = payload.get("pull_request", {})
         if pr.get("merged"):
             dispatch_dependents(pr)
+
+    # ── Issue closed (manual close, not via PR) → unblock dependents ──
+    elif event == "issues" and action == "closed":
+        issue = payload.get("issue", {})
+        issue_number = issue.get("number")
+        if issue_number:
+            _unblock_dependents_of({issue_number})
 
     # ── PR opened or updated ──────────────────────────
     # Reviews run sequentially: QA first; Security runs only after QA

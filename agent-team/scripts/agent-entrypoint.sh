@@ -95,10 +95,25 @@ fi
 # ─── Load project context ────────────────────────────────
 # AGENTS.md in the repo root provides project-specific context
 # (tech stack, versions, conventions) that all agents need.
+#
+# The Linux kernel's MAX_ARG_STRLEN caps any single execve() argument at
+# 128KiB (32 * PAGE_SIZE). We pass AGENTS.md to `claude --system-prompt`
+# below as one arg, so AGENTS.md plus the role prompt must stay under
+# ~110KB combined. Cap AGENTS.md at 100KB with a note pointing back to
+# the on-disk file so agents can read the tail if they need it.
 PROJECT_CONTEXT=""
+AGENTS_MAX_BYTES=102400
 if [ -f "${WORK_DIR}/AGENTS.md" ]; then
-    PROJECT_CONTEXT=$(cat "${WORK_DIR}/AGENTS.md")
-    echo "✓ Project context loaded (AGENTS.md)"
+    AGENTS_SIZE=$(wc -c < "${WORK_DIR}/AGENTS.md")
+    if [ "${AGENTS_SIZE}" -gt "${AGENTS_MAX_BYTES}" ]; then
+        PROJECT_CONTEXT="$(head -c ${AGENTS_MAX_BYTES} "${WORK_DIR}/AGENTS.md")
+
+[Truncated at ${AGENTS_MAX_BYTES} bytes for execve compatibility — full AGENTS.md is ${AGENTS_SIZE} bytes on disk at \`./AGENTS.md\`. Read it directly if you need the remaining content. Move large appendices (architectural debt, historical notes, deep references) to sibling files like \`docs/AGENTS-DEBT.md\` to keep AGENTS.md small.]"
+        echo "⚠ AGENTS.md is ${AGENTS_SIZE} bytes — truncated to ${AGENTS_MAX_BYTES} for system prompt"
+    else
+        PROJECT_CONTEXT=$(cat "${WORK_DIR}/AGENTS.md")
+        echo "✓ Project context loaded (AGENTS.md, ${AGENTS_SIZE} bytes)"
+    fi
 fi
 
 # ─── Build system prompt ─────────────────────────────────
