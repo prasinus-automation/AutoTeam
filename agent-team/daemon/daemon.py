@@ -190,17 +190,27 @@ def gh_comment(issue_number, body):
 
 
 def gh_issue_has_open_pr(issue_number):
-    """Check if an issue already has an open PR (by body reference or branch name)."""
+    """Check if an issue already has an open PR.
+
+    Body match requires a closing keyword (`Closes/Fixes/Resolves/Part of #N`)
+    — what our dev prompts require in every PR. A bare substring check
+    (`f"#{N}" in pr_body`) false-positives on `#1050` for issue `#105` and
+    on casual cross-references like "see #105 for context", which silently
+    suppresses the dev-in-progress recovery scan below and leaves issues
+    stuck under `dev-in-progress` indefinitely.
+    """
+    body_re = re.compile(
+        rf"\b(?:closes|fixes|resolves|part of)\s+#{issue_number}\b",
+        re.IGNORECASE,
+    )
+    branch_re = re.compile(rf"(?:^|/){issue_number}\b")
     try:
         for pr in gh_get_prs("open"):
             pr_body = pr.get("body", "") or ""
             branch = pr.get("head", {}).get("ref", "")
-            # Check PR body for "Closes #N", "#N", etc.
-            if f"#{issue_number}" in pr_body:
+            if body_re.search(pr_body):
                 return True
-            # Check branch name for the issue number (e.g., frontend/5-slug)
-            import re
-            if re.search(rf'(?:^|/)(?:{issue_number})\b', branch):
+            if branch_re.search(branch):
                 return True
     except Exception:
         pass
