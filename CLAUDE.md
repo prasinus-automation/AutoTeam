@@ -67,7 +67,7 @@ docker compose --profile build-only build agent-<role>   # e.g. agent-architect,
 **Event flow**:
 - `issue.labeled "architect"` → spawns Architect (action: `plan_feature`)
 - `issue.labeled "frontend-dev" / "backend-dev" / "fullstack-dev"` → spawns the matching dev (up to `MAX_<ROLE>_AGENTS`; excess queues)
-- `pull_request.opened/synchronize` → spawns QA. Security runs **after** QA approves, not in parallel. Approval is detected from comment headers (agents share a token, so formal PR approvals don't fire reviewer events).
+- `pull_request.opened/synchronize` → spawns QA. Security runs **after** QA approves, not in parallel. Approval is detected from comment headers carrying an HMAC-signed `<!-- approval-token: {role}:{sha}:{hmac} -->` footer, authored by the daemon's bot login, against the PR's current head SHA. Comments that fail any of those checks are dropped silently — see "Approval / authentication model" in AGENTS.md.
 - `pull_request.labeled "needs-fixes"` → parses branch prefix (`frontend/`, `backend/`, `fullstack/`), fetches review feedback, re-spawns the matching dev
 - Both QA and Security approved → spawns Architect-Merger
 - `pull_request.closed` (merged) → `dispatch_dependents` calls `_unblock_dependents_of(closed_issues_from_PR_body)` → for each open issue whose `Depends on #N` / `Blocked by #N` / `After #N` deps are all closed: strip `blocked`, post unblock comment, spawn Architect with action `re_triage_unblocked`

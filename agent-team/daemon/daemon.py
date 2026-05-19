@@ -65,6 +65,13 @@ MEMORY_VOLUME = f"{PROJECT_NAME}_agent-memory"
 MAX_TOTAL_AGENTS = int(os.environ.get("MAX_TOTAL_AGENTS", "3"))
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "9876"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# Bot login (GitHub username the daemon's GITHUB_TOKEN authenticates as). Used
+# as the author-allowlist gate for approval-verdict comments — only comments
+# authored by this login are eligible to count as QA/Security verdicts. If
+# unset, the daemon discovers it at startup via `GET /user` and refuses to
+# start in webhook mode if discovery fails (see `_discover_bot_login`). The
+# operator can pre-set this in .env to skip the discovery round-trip.
+BOT_LOGIN = os.environ.get("BOT_LOGIN", "")
 # How often (in minutes) the background loop sweeps `blocked` issues so a
 # missed unblock event (daemon down, in-memory state collision, etc.) is
 # eventually self-healed without operator intervention. The startup scan
@@ -326,6 +333,264 @@ def gh_check_both_approved(pr_number):
     return qa_approved and security_approved
 
 
+# ─── Approval / authentication model ─────────────────────
+#
+# Three layers of defense against approval spoofing (see #50 / #66):
+#
+#   1. **Author allowlist** — verdict comments are only honored when posted
+#      by `state.bot_login` (the GitHub user the daemon's token authenticates
+#      as). Anyone else writing `## QA Review: ✅ APPROVED` is ignored.
+#
+#   2. **HMAC-signed footer** — every QA / Security verdict carries a footer
+#      of the form `<!-- approval-token: {role}:{sha}:{hmac} -->`. The daemon
+#      computes the expected HMAC under `WEBHOOK_SECRET` against
+#      `f"{role}:{sha}"` and rejects any verdict whose footer doesn't verify.
+#
+#   3. **SHA binding** — the SHA in the footer must equal the PR's current
+#      `head.sha`. Once a dev pushes a new commit (a `synchronize` event),
+#      the head SHA changes and any stale token is invalidated. This is the
+#      anti-replay property: an attacker can't replay yesterday's verdict
+#      against a newly-pushed branch.
+#
+# The signing key (`WEBHOOK_SECRET`) MUST stay daemon-only — workers receive
+# pre-computed tokens, never the secret itself.
+#
+# All three approval parse sites (`_latest_reviews_approved`,
+# `_classify_pr_reviews`, and the `issue_comment` webhook handler) MUST go
+# through `_extract_signed_verdicts`. Duplicating the parse logic was the
+# original cause of the spoofing window — see AGENTS.md "Approval /
+# authentication model" for the contract.
+
+APPROVAL_HEADER_RE = re.compile(
+    # Anchored at SOL (start-of-line) under MULTILINE so a header anywhere
+    # in the body works, but it must start at column 0 — prose elsewhere in
+    # the body can't false-match. Whitespace AFTER the colon is required (at
+    # least one space) and the verdict glyph itself MUST be followed by a
+    # space before APPROVED / CHANGES REQUESTED. This tighter form means a
+    # near-miss like `## QA Review:✅APPROVED` (no spaces) does NOT match —
+    # a future widening of the regex is a test failure, not a silent
+    # security regression. The `\b` after the verdict ensures we don't match
+    # `APPROVEDISH` and similar.
+    r"^## (?P<role>QA|Security) (?:Re-?\s*)?Review:[ \t]+"
+    r"(?P<verdict>✅[ \t]+APPROVED|❌[ \t]+CHANGES REQUESTED)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+APPROVAL_FOOTER_RE = re.compile(
+    r"<!--\s*approval-token:\s*"
+    r"(?P<role>qa|security):"
+    r"(?P<sha>[0-9a-fA-F]{4,64}):"
+    r"(?P<hmac>[0-9a-fA-F]{32})"
+    r"\s*-->"
+)
+
+
+def compute_approval_token(role, pr_head_sha):
+    """Compute the 32-char HMAC token for a (role, sha) pair under
+    WEBHOOK_SECRET. Used both at spawn time (to pass to QA/Security workers)
+    and at verification time (to compare against incoming footers).
+
+    Role is normalized to lowercase 'qa' / 'security' so callers don't have
+    to remember casing. Returns an empty string if WEBHOOK_SECRET is unset —
+    the verification path treats an empty expected token as "unverifiable"
+    and rejects the comment, which is the correct fail-closed behavior."""
+    if not WEBHOOK_SECRET or not pr_head_sha:
+        return ""
+    role_norm = (role or "").strip().lower()
+    return hmac.new(
+        WEBHOOK_SECRET.encode(),
+        f"{role_norm}:{pr_head_sha}".encode(),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+
+
+def _discover_bot_login():
+    """Resolve the GitHub login the daemon's token authenticates as.
+
+    Returns the login string on success, "" on failure. Caller decides
+    whether to fail-closed (we do, in webhook mode — see `main`)."""
+    if BOT_LOGIN:
+        log.info(f"BOT_LOGIN set explicitly to '{BOT_LOGIN}' — skipping /user lookup")
+        return BOT_LOGIN
+    try:
+        resp = requests.get(f"{API}/user", headers=HEADERS, timeout=10)
+        if resp.status_code != 200:
+            log.error(
+                f"Bot identity discovery failed: GET /user returned "
+                f"{resp.status_code} {resp.text[:200]}"
+            )
+            return ""
+        data = resp.json()
+        login = data.get("login") or ""
+        if not login:
+            log.error("Bot identity discovery: /user returned no login field")
+            return ""
+        log.info(f"Bot identity resolved via GET /user: '{login}'")
+        return login
+    except Exception as e:
+        log.error(f"Bot identity discovery raised: {e}")
+        return ""
+
+
+def _extract_signed_verdicts(comments, current_head_sha):
+    """Walk PR comments and return ``{role: (state, timestamp)}`` for each
+    role (``qa`` and/or ``security``) whose latest verdict comment passes
+    every authentication check:
+
+      1. Author == ``state.bot_login`` (the daemon's bot identity).
+      2. Body matches the strict ``APPROVAL_HEADER_RE`` anchored at SOL with
+         optional ``Re-`` prefix. Lines starting with ``>`` (blockquote)
+         are stripped before matching so quoted prose can't trigger a
+         verdict.
+      3. Body has exactly one well-formed ``<!-- approval-token: ... -->``
+         footer.
+      4. Footer's role matches the header's role.
+      5. Footer's HMAC verifies under ``WEBHOOK_SECRET`` against
+         ``f"{role}:{sha}"`` using ``hmac.compare_digest``.
+      6. Footer's SHA equals the PR's CURRENT ``head.sha`` — stale tokens
+         from a prior push are rejected.
+
+    Any failure drops the verdict silently and logs at WARNING naming the
+    failed check. Stale-invalidation logic is preserved: a ``changes``
+    verdict is dropped if the OTHER reviewer's ``approved`` verdict is more
+    recent (so a stale changes-requested doesn't pin the PR forever after
+    the dev has pushed a fix the other reviewer signed off on).
+
+    Returns a dict like ``{"qa": ("approved", "2024-01-01T00:00:00Z")}`` —
+    only roles that pass authentication appear. The caller decides what to
+    do with missing roles. Walked newest-first so the latest verdict per
+    role wins.
+    """
+    if not isinstance(comments, list):
+        return {}
+
+    bot_login = (state.bot_login or "").lower()
+    if not bot_login:
+        log.warning("approval rejected: BOT_LOGIN unresolved at daemon startup")
+        return {}
+
+    # Newest-first walk — first match per role wins.
+    out = {}
+    for c in reversed(comments):
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body", "") or ""
+        author = ((c.get("user") or {}).get("login") or "").lower()
+        ts = c.get("created_at", "")
+
+        # Step 1: author allowlist
+        if author != bot_login:
+            # Don't log every non-bot comment — the daemon receives many
+            # legitimate human comments. Only log when the body has an
+            # approval-shaped header (the spoofing-attempt signal).
+            if APPROVAL_HEADER_RE.search(body):
+                log.warning(
+                    f"approval rejected: author mismatch (got '{author}', "
+                    f"expected '{bot_login}')"
+                )
+            continue
+
+        # Strip blockquoted lines BEFORE header-matching so quoted prose
+        # like `> ## QA Review: ✅ APPROVED ...` (a forwarded quote) cannot
+        # trigger a verdict on its own.
+        scrub = "\n".join(
+            ln for ln in body.splitlines() if not ln.lstrip().startswith(">")
+        )
+
+        # Step 2: regex match on scrubbed body
+        m_header = APPROVAL_HEADER_RE.search(scrub)
+        if not m_header:
+            continue
+        role_header = m_header.group("role").lower()
+        verdict_text = m_header.group("verdict").upper()
+        if "CHANGES REQUESTED" in verdict_text:
+            verdict_state = "changes"
+        elif "APPROVED" in verdict_text:
+            verdict_state = "approved"
+        else:
+            continue
+
+        # Skip if we already recorded a newer verdict for this role.
+        if role_header in out:
+            continue
+
+        # Step 3: exactly one well-formed footer
+        footers = APPROVAL_FOOTER_RE.findall(scrub)
+        if len(footers) != 1:
+            log.warning(
+                f"approval rejected: expected 1 approval-token footer, "
+                f"found {len(footers)} on {role_header} verdict"
+            )
+            continue
+        footer_role, footer_sha, footer_hmac = footers[0]
+        footer_role = footer_role.lower()
+
+        # Step 4: footer role matches header role
+        if footer_role != role_header:
+            log.warning(
+                f"approval rejected: footer role '{footer_role}' does not "
+                f"match header role '{role_header}'"
+            )
+            continue
+
+        # Step 5: HMAC verifies
+        expected = compute_approval_token(footer_role, footer_sha)
+        if not expected or not hmac.compare_digest(expected, footer_hmac.lower()):
+            log.warning(
+                f"approval rejected: HMAC verification failed for "
+                f"{footer_role} on sha {footer_sha[:7]}"
+            )
+            continue
+
+        # Step 6: SHA matches current head
+        if not current_head_sha or footer_sha.lower() != current_head_sha.lower():
+            log.warning(
+                f"approval rejected: footer sha {footer_sha[:7]} "
+                f"does not match current head sha "
+                f"{(current_head_sha or '')[:7]}"
+            )
+            continue
+
+        out[role_header] = (verdict_state, ts)
+        # Stop early when we have both — they're the only roles we honor.
+        if "qa" in out and "security" in out:
+            break
+
+    # Stale-verdict invalidation: a `changes` verdict against older code is
+    # superseded by a more recent `approved` from the OTHER reviewer. Without
+    # this, an old changes-requested pins the PR in needs-fixes forever even
+    # though the dev has since pushed a fix the other reviewer signed off on.
+    qa = out.get("qa")
+    sec = out.get("security")
+    if qa and sec:
+        qa_state, qa_ts = qa
+        sec_state, sec_ts = sec
+        if qa_state == "changes" and sec_state == "approved" and qa_ts and sec_ts and sec_ts > qa_ts:
+            out.pop("qa", None)
+        elif sec_state == "changes" and qa_state == "approved" and qa_ts and sec_ts and qa_ts > sec_ts:
+            out.pop("security", None)
+
+    return out
+
+
+def _fetch_pr_head_sha(pr_number):
+    """Fetch a PR's current head SHA. Returns "" on failure. Used by the
+    three approval parse sites so they all bind to the freshest SHA, not
+    cached state."""
+    try:
+        resp = requests.get(
+            f"{API}/repos/{GITHUB_REPO}/pulls/{pr_number}",
+            headers=HEADERS, timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        return ((data.get("head") or {}).get("sha")) or ""
+    except Exception as e:
+        log.debug(f"head-sha fetch for PR #{pr_number}: {e}")
+        return ""
+
+
 # ─── Dependency / PR-close link parsing ──────────────────
 #
 # Two related concerns, both expressed in GitHub Markdown bodies:
@@ -574,6 +839,13 @@ class DaemonState:
         # Webhooks are still received and parsed; in-flight agents complete.
         self.paused = False
         self.paused_reason = ""
+        # Bot login (GitHub username this daemon's token authenticates as).
+        # Populated at startup by `_discover_bot_login` from the BOT_LOGIN env
+        # var or `GET /user`. Used as the author-allowlist gate in
+        # `_extract_signed_verdicts` — only comments authored by this login
+        # are eligible to count as QA/Security verdicts. Daemon refuses to
+        # start if this can't be resolved (see `main`).
+        self.bot_login = ""
         self.lock = threading.Lock()
 
     def already_handled(self, key):
@@ -680,6 +952,42 @@ def spawn_agent(role, task_context, issue_or_pr_number, extras=None):
         }
         if ANTHROPIC_API_KEY:
             env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+
+        # Approval-token plumbing (issue #66). QA / Security need an
+        # HMAC-signed token to embed in their verdict comments; architect-
+        # merger needs the EXPECTED tokens so it can re-verify the latest QA
+        # / Security comments before squash-merging. WEBHOOK_SECRET stays
+        # daemon-only — workers receive pre-computed tokens, never the key
+        # itself. Devs (frontend / backend / fullstack) and architect-the-
+        # planner deliberately get neither so they can't forge a verdict.
+        pr_head_sha = (extras or {}).get("pr_head_sha") if extras else None
+        if role in ("qa", "security") and pr_head_sha:
+            token = compute_approval_token(role, pr_head_sha)
+            if token:
+                env["APPROVAL_TOKEN"] = token
+                env["PR_HEAD_SHA"] = pr_head_sha
+                env["PR_NUMBER"] = str(issue_or_pr_number)
+            else:
+                # WEBHOOK_SECRET unset — the verdict-verification path will
+                # reject everything anyway. Log loudly so the operator
+                # knows tokens are being skipped.
+                log.warning(
+                    f"Cannot compute APPROVAL_TOKEN for {role} #{issue_or_pr_number} "
+                    f"— WEBHOOK_SECRET unset"
+                )
+        if role == "architect-merger":
+            exp_qa = (extras or {}).get("expected_qa_token") or ""
+            exp_sec = (extras or {}).get("expected_sec_token") or ""
+            exp_sha = (extras or {}).get("expected_head_sha") or ""
+            if exp_qa:
+                env["EXPECTED_QA_TOKEN"] = exp_qa
+            if exp_sec:
+                env["EXPECTED_SEC_TOKEN"] = exp_sec
+            if exp_sha:
+                env["EXPECTED_HEAD_SHA"] = exp_sha
+                env["PR_HEAD_SHA"] = exp_sha
+            if issue_or_pr_number is not None:
+                env["PR_NUMBER"] = str(issue_or_pr_number)
 
         volumes = {
             REPO_CACHE_VOLUME: {"bind": "/repo", "mode": "ro"},
@@ -1502,6 +1810,7 @@ def dispatch_qa(pr):
     branch = pr.get("head", {}).get("ref", "")
     if branch.startswith("docs/"):
         return
+    head_sha = (pr.get("head") or {}).get("sha", "")
     result = spawn_agent("qa", {
         "action": "review_pr",
         "pr_number": number,
@@ -1509,7 +1818,8 @@ def dispatch_qa(pr):
         "pr_body": pr.get("body", ""),
         "pr_url": pr.get("html_url", ""),
         "pr_branch": branch,
-    }, number)
+        "pr_head_sha": head_sha,
+    }, number, extras={"pr_head_sha": head_sha})
     if result:
         log.info(f"QA review: PR #{number} — {pr['title']}")
     else:
@@ -1524,6 +1834,7 @@ def dispatch_security(pr):
     branch = pr.get("head", {}).get("ref", "")
     if branch.startswith("docs/"):
         return
+    head_sha = (pr.get("head") or {}).get("sha", "")
     result = spawn_agent("security", {
         "action": "review_pr",
         "pr_number": number,
@@ -1531,7 +1842,8 @@ def dispatch_security(pr):
         "pr_body": pr.get("body", ""),
         "pr_url": pr.get("html_url", ""),
         "pr_branch": branch,
-    }, number)
+        "pr_head_sha": head_sha,
+    }, number, extras={"pr_head_sha": head_sha})
     if result:
         log.info(f"Security review: PR #{number} — {pr['title']}")
     else:
@@ -1539,58 +1851,24 @@ def dispatch_security(pr):
 
 
 def _latest_reviews_approved(pr_number):
-    """Check if the latest QA and Security comments are approvals (not changes requested).
-    Returns True if both have reviewed and both approved, meaning no fixes are needed."""
+    """Check whether both QA and Security have currently-valid `approved`
+    verdicts on the PR's current head SHA. Returns True only if BOTH roles
+    have a verdict and BOTH are `approved`. Goes through
+    `_extract_signed_verdicts`, which enforces the full author + regex +
+    HMAC + SHA-binding chain (see the "Approval / authentication model"
+    section above). Stale-invalidation and the issue_comment handler share
+    the same helper — never duplicate this parse logic."""
     try:
-        resp = requests.get(
-            f"{API}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
-            headers=HEADERS,
-            params={"per_page": 100},
-        )
-        if resp.status_code != 200:
-            return False
-        # Follow pagination to last page for heavily-commented PRs
-        link_header = resp.headers.get("Link", "")
-        if 'rel="last"' in link_header:
-            last_match = re.search(r'<([^>]+)>;\s*rel="last"', link_header)
-            if last_match:
-                last_resp = requests.get(last_match.group(1), headers=HEADERS)
-                if last_resp.status_code == 200:
-                    comments = last_resp.json()
-                else:
-                    comments = resp.json()
-            else:
-                comments = resp.json()
-        else:
-            comments = resp.json()
-
-        last_qa_approved = False
-        last_sec_approved = False
-        has_qa = False
-        has_sec = False
-        for c in reversed(comments):
-            body = c.get("body", "")
-            if "Daemon-verified:" in body or "Agent `" in body:
-                continue
-            # Only check the first line (header) for verdict to avoid false positives
-            # from ✅ checkmarks in the body of CHANGES REQUESTED reviews
-            header = body.split("\n")[0] if body else ""
-            if "QA Review" in header and not has_qa:
-                has_qa = True
-                if "CHANGES REQUESTED" in header.upper():
-                    last_qa_approved = False
-                else:
-                    last_qa_approved = "APPROVED" in header.upper() or "✅" in header
-            if "Security Review" in header and not has_sec:
-                has_sec = True
-                if "CHANGES REQUESTED" in header.upper():
-                    last_sec_approved = False
-                else:
-                    last_sec_approved = "APPROVED" in header.upper() or "✅" in header
-
-        return has_qa and last_qa_approved and has_sec and last_sec_approved
+        comments = _fetch_pr_comments_last_page(pr_number)
     except Exception:
         return False
+    head_sha = _fetch_pr_head_sha(pr_number)
+    if not head_sha:
+        return False
+    verdicts = _extract_signed_verdicts(comments, head_sha)
+    qa = verdicts.get("qa")
+    sec = verdicts.get("security")
+    return bool(qa and sec and qa[0] == "approved" and sec[0] == "approved")
 
 
 _BRANCH_PREFIX_ROLE = {
@@ -1746,7 +2024,12 @@ def dispatch_needs_fixes(pr):
 def dispatch_architect_merge(pr):
     """Spawn architect-merger (separate role from the planner) to merge an
     approved PR. Splitting planning and merging keeps each prompt tight to
-    its job and limits the blast radius of a misbehaving planner."""
+    its job and limits the blast radius of a misbehaving planner.
+
+    Computes the EXPECTED QA / Security tokens against the PR's current head
+    SHA and passes them to the merger as env vars (Option A from issue #66:
+    the merger does string-equality, not HMAC math). WEBHOOK_SECRET MUST
+    stay daemon-only — never propagate it to workers."""
     number = pr["number"]
     key = f"merge-{number}"
     if state.already_handled(key):
@@ -1756,6 +2039,8 @@ def dispatch_architect_merge(pr):
     # detect whether the merger pushed a new commit (e.g., a conflict
     # resolution) — that case shouldn't be treated as "merger declined."
     pre_run_head_sha = pr.get("head", {}).get("sha")
+    expected_qa = compute_approval_token("qa", pre_run_head_sha) if pre_run_head_sha else ""
+    expected_sec = compute_approval_token("security", pre_run_head_sha) if pre_run_head_sha else ""
     log.info(f"Both approved: PR #{number} — spawning architect-merger")
     result = spawn_agent("architect-merger", {
         "action": "merge_approved_pr",
@@ -1764,58 +2049,30 @@ def dispatch_architect_merge(pr):
         "pr_body": pr.get("body", ""),
         "pr_url": pr.get("html_url", ""),
         "pr_branch": pr.get("head", {}).get("ref", ""),
-    }, number, extras={"pre_run_head_sha": pre_run_head_sha})
+        "expected_head_sha": pre_run_head_sha,
+    }, number, extras={
+        "pre_run_head_sha": pre_run_head_sha,
+        "expected_qa_token": expected_qa,
+        "expected_sec_token": expected_sec,
+        "expected_head_sha": pre_run_head_sha,
+    })
     if result is None:
         state.clear_handled(key)
 
 
-def _classify_pr_reviews(comments):
-    """Walk comments newest-first and return (qa_state, sec_state) where each
-    is 'approved', 'changes', or None.
+def _classify_pr_reviews(comments, current_head_sha):
+    """Walk comments via the shared `_extract_signed_verdicts` helper and
+    return ``(qa_state, sec_state)`` where each is 'approved', 'changes',
+    or None.
 
-    Stale-verdict invalidation: a `changes` verdict is treated as None if the
-    OTHER reviewer issued an `approved` verdict more recently. The reasoning:
-    if QA approved at T2 on the latest code, a Security `changes` from T1 was
-    written against older code — the dev has since pushed a fix that QA has
-    re-reviewed and signed off on, so Security needs to re-run, not the dev.
-    Without this, a stale changes-requested verdict pins the PR in needs-fixes
-    forever despite the dev having already addressed everything."""
-    # First pass: find the latest verdict + timestamp for each reviewer.
-    # Match both "QA Review" and "QA Re-review" (some agents stylize the
-    # follow-up review with a hyphen). The regexes below allow optional
-    # "Re-" / "Re " prefixes so a stylized header still classifies.
-    qa_state = qa_ts = None
-    sec_state = sec_ts = None
-    qa_pat = re.compile(r"\bQA\s+(?:RE-?\s*)?REVIEW\b")
-    sec_pat = re.compile(r"\bSECURITY\s+(?:RE-?\s*)?REVIEW\b")
-    for c in reversed(comments):
-        body = c.get("body", "") or ""
-        if body.startswith("⚠️ Agent ") or body.startswith("⏳ Agent ") or "Daemon-verified:" in body:
-            continue
-        header = body.split("\n")[0]
-        upper = header.upper()
-        ts = c.get("created_at", "")
-        if qa_state is None and qa_pat.search(upper):
-            if "CHANGES REQUESTED" in upper:
-                qa_state, qa_ts = "changes", ts
-            elif "APPROVED" in upper or "✅" in header:
-                qa_state, qa_ts = "approved", ts
-        if sec_state is None and sec_pat.search(upper):
-            if "CHANGES REQUESTED" in upper:
-                sec_state, sec_ts = "changes", ts
-            elif "APPROVED" in upper or "✅" in header:
-                sec_state, sec_ts = "approved", ts
-        if qa_state is not None and sec_state is not None:
-            break
-
-    # Stale invalidation: a changes-requested verdict against older code is
-    # superseded by a more recent approval from the other reviewer.
-    if qa_state == "changes" and sec_state == "approved" and qa_ts and sec_ts and sec_ts > qa_ts:
-        qa_state = None
-    if sec_state == "changes" and qa_state == "approved" and qa_ts and sec_ts and qa_ts > sec_ts:
-        sec_state = None
-
-    return qa_state, sec_state
+    Thin wrapper now — the heavy lifting (author allowlist, HMAC, SHA-
+    binding, stale invalidation) all lives in the shared helper. Takes the
+    current head SHA explicitly so the caller (reconcile_pr) doesn't make
+    an extra HTTP round-trip when it already has the PR object."""
+    verdicts = _extract_signed_verdicts(comments, current_head_sha)
+    qa = verdicts.get("qa")
+    sec = verdicts.get("security")
+    return (qa[0] if qa else None), (sec[0] if sec else None)
 
 
 def _fetch_pr_comments_last_page(pr_number):
@@ -1871,7 +2128,8 @@ def reconcile_pr(pr):
         log.debug(f"Reconcile PR #{pr_number}: {e}")
         return
 
-    qa_state, sec_state = _classify_pr_reviews(comments)
+    head_sha = (pr.get("head") or {}).get("sha") or ""
+    qa_state, sec_state = _classify_pr_reviews(comments, head_sha)
 
     if qa_state == "approved" and sec_state == "approved":
         dispatch_architect_merge(pr)
@@ -2108,20 +2366,42 @@ def handle_webhook_event(event, payload):
     # Agents can't submit formal reviews (same token as PR author),
     # so we detect approval from comment text instead.
     elif event == "issue_comment" and action == "created":
-        comment_body = payload.get("comment", {}).get("body", "")
+        comment = payload.get("comment", {}) or {}
+        comment_body = comment.get("body", "") or ""
         issue = payload.get("issue", {})
         # Only care about PR comments (issues with pull_request key)
         if issue.get("pull_request"):
-            # Skip daemon-posted comments to avoid self-triggering loops
+            # Skip daemon-posted comments to avoid self-triggering loops.
+            # NB: this is a self-loop guard only — NOT an authenticity check.
+            # The author-allowlist + HMAC chain in `_extract_signed_verdicts`
+            # is the security boundary.
             if "Daemon-verified:" in comment_body or "Agent `" in comment_body:
                 return
             pr_number = issue["number"]
             pr_url = issue["pull_request"].get("url", "")
-            # Check the header line only to avoid false positives from ✅ in body
-            comment_header = comment_body.split("\n")[0] if comment_body else ""
-            if "CHANGES REQUESTED" in comment_header.upper() or "❌" in comment_header:
-                # QA or Security requested changes — add label and trigger fix flow
-                log.info(f"Changes requested on PR #{pr_number} via comment")
+            # Route through the SAME signed-verdict helper as the polling
+            # path so a forged comment (wrong author, missing footer, bad
+            # HMAC, stale SHA) can neither apply `needs-fixes` nor spawn
+            # architect-merger. Fetch the live PR head SHA — the verdict
+            # MUST bind to current state, not the comment author's claim.
+            head_sha = _fetch_pr_head_sha(pr_number)
+            if not head_sha:
+                log.warning(f"issue_comment: could not fetch head SHA for PR #{pr_number} — dropping")
+                return
+            verdicts = _extract_signed_verdicts([comment], head_sha)
+            if not verdicts:
+                # Comment doesn't authenticate as a verdict — ignore. The
+                # daemon was previously triggering on raw header text here,
+                # which is exactly the spoofing vector #50 / #66 closes.
+                return
+
+            # Apply the verdict(s) from THIS comment. Newest-first walk by
+            # design — for each role authenticated in this single comment,
+            # apply that verdict.
+            any_changes = any(v[0] == "changes" for v in verdicts.values())
+            any_approved = any(v[0] == "approved" for v in verdicts.values())
+            if any_changes:
+                log.info(f"Authenticated changes-requested on PR #{pr_number} via comment")
                 gh_add_label(pr_number, "needs-fixes")
                 try:
                     pr_resp = requests.get(
@@ -2133,7 +2413,7 @@ def handle_webhook_event(event, payload):
                         dispatch_needs_fixes(pr_resp.json())
                 except Exception as e:
                     log.error(f"Error triggering fixes for PR #{pr_number}: {e}")
-            elif "APPROVED" in comment_header.upper() or "✅" in comment_header:
+            elif any_approved:
                 if pr_url:
                     _on_review_approved(pr_number, pr_url)
 
@@ -2492,10 +2772,31 @@ def main():
         log.error("WEBHOOK_SECRET is empty in webhook mode. Set it in .env and restart.")
         sys.exit(1)
 
+    # Bot identity discovery — required for the author-allowlist gate on
+    # approval verdicts (#66). Without it, the daemon has no way to tell a
+    # legitimate QA / Security comment from a spoof. Fail closed in webhook
+    # mode (no signing identity = no auth). Polling mode still tries to
+    # resolve so the helper works, but doesn't hard-fail since polling-mode
+    # operators are typically running offline / single-user setups.
+    state.bot_login = _discover_bot_login()
+    if not state.bot_login:
+        if MODE == "webhook":
+            log.error(
+                "Bot identity could not be resolved (BOT_LOGIN env var unset "
+                "and GET /user failed). Approval-verdict authentication "
+                "requires a known bot login. Refusing to start in webhook mode."
+            )
+            sys.exit(1)
+        log.warning(
+            "Bot identity unresolved — approval-verdict authentication will "
+            "reject all verdicts. Set BOT_LOGIN env var to fix."
+        )
+
     log.info("═══════════════════════════════════════")
     log.info(f"  Agent Team Daemon")
     log.info(f"  Mode: {MODE}")
     log.info(f"  Repo: {GITHUB_REPO}")
+    log.info(f"  Bot login: {state.bot_login or '<unresolved>'}")
     log.info(f"  Frontend devs: {MAX_FRONTEND_AGENTS}")
     log.info(f"  Backend devs: {MAX_BACKEND_AGENTS}")
     log.info(f"  Fullstack devs: {MAX_FULLSTACK_AGENTS}")

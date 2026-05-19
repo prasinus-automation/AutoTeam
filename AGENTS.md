@@ -117,6 +117,63 @@ If you add tests, prefer `pytest` (not yet a dep) and keep them in `agent-team/d
 - `architect-in-progress` and `dev-in-progress` are **single-writer per issue** — the agent that's running owns it. Recovery sweeps (in `poll_github`) re-label them if no container is running.
 - `blocked` is automatic; `needs-attention` is manual triage that the daemon never touches.
 
+### Approval / authentication model
+
+QA and Security verdict comments are authenticated via three layers — added
+in #66 to close the spoofing vulnerability in #50. **All three approval
+parse sites** (`_latest_reviews_approved`, `_classify_pr_reviews`, and the
+`issue_comment` webhook handler) MUST go through `_extract_signed_verdicts`.
+Inlining the parse was the original spoofing window.
+
+**Three layers of defense, evaluated in order:**
+
+1. **Author allowlist.** The comment's `user.login` MUST equal
+   `state.bot_login` — the GitHub login the daemon's `GITHUB_TOKEN`
+   authenticates as. Bot identity is resolved at startup via
+   `_discover_bot_login` (uses `BOT_LOGIN` env var if set, otherwise calls
+   `GET /user`). The daemon **refuses to start in webhook mode if bot
+   identity is unresolved** — fail-closed.
+
+2. **HMAC-signed footer.** Every QA / Security verdict comment MUST include
+   a single footer of the form:
+
+   ```
+   <!-- approval-token: {role}:{sha}:{hmac32} -->
+   ```
+
+   The `hmac32` is the first 32 hex chars of
+   `HMAC-SHA256(WEBHOOK_SECRET, f"{role}:{sha}")`. Both approve and
+   changes-requested verdicts must include the footer. Missing footer,
+   duplicate footers, or wrong-role footer → silent rejection.
+
+3. **SHA binding.** The `sha` in the footer MUST equal the PR's current
+   `head.sha` (fetched live, not cached). Once a dev pushes a new commit
+   (a `synchronize` event), the head SHA changes and any stale token from
+   a prior commit is auto-invalidated. This is the anti-replay property.
+
+**Worker plumbing:**
+
+- QA / Security workers receive `APPROVAL_TOKEN`, `PR_HEAD_SHA`, and
+  `PR_NUMBER` as env vars at spawn time. The prompts instruct the agent to
+  echo these into the footer — no crypto in the prompt.
+- Architect-merger receives `EXPECTED_QA_TOKEN`, `EXPECTED_SEC_TOKEN`, and
+  `EXPECTED_HEAD_SHA` and does string-equality checks against the live
+  comments + a CI-status check before squash-merging.
+- Dev / architect-planner workers receive **none** of these. They share the
+  bot's `GITHUB_TOKEN`, so withholding the approval token is what prevents
+  a runaway dev from forging a QA verdict.
+- `WEBHOOK_SECRET` is daemon-only. **Never** put it in a worker container's
+  env dict — that defeats the entire scheme.
+
+**Regex contract:**
+
+- Header: `APPROVAL_HEADER_RE` requires `^## (QA|Security) [Re-Review:|Review:] ✅ APPROVED` (or `❌ CHANGES REQUESTED`) anchored at SOL under `re.MULTILINE`. At least one space is required after `:` and after the verdict glyph — the regex is intentionally strict so future relaxations are caught by the regex-pin test in `test_approval.py`.
+- Blockquoted lines (`> ...`) are stripped from the body before header matching.
+- Footer: `APPROVAL_FOOTER_RE` requires exactly the form documented above; whitespace inside the comment is tolerated, the hash must be 32 hex chars.
+
+If you change anything above, update `agent-team/daemon/tests/test_approval.py`,
+both worker prompts (`qa.md`, `security.md`), and the architect-merger prompt.
+
 ### Dependency parsing — regex contract
 The daemon parses dependency/close keywords from issue and PR bodies via the
 helpers `_parse_dep_refs`, `_parse_pr_close_refs_from_body`, and
@@ -169,3 +226,4 @@ Commits follow conventional-commit-ish prefixes used in `git log`: `fix:`, `feat
 - **Agent containers share a `GH_TOKEN`**, so `gh pr review --approve` events appear from the same user that opened the PR — formal review approval events don't fire. Agents communicate approval via comment headers parsed in `daemon.py`. Don't try to use review events for cross-agent signaling.
 - **`gh issue edit --remove-label X` is a no-op if the label isn't present.** Don't rely on it raising. Check labels first if you need conditional logic.
 - **HMAC verification** is required on all `POST` endpoints (`/pause`, `/resume`, `/sweep-blocked`). Use the `WEBHOOK_SECRET` from the project's `.env`.
+- **Approval-spoofing fix (#66) — three things must travel together.** If you touch any of (a) `_extract_signed_verdicts`, (b) the env dict in `spawn_agent`, (c) the QA / Security / architect-merger prompts — re-check the others. Breaking the link between worker tokens and daemon-side verification turns a strict gate into a no-op gate. The `test_approval.py` regex-pin test catches one common regression (loosening the header regex); the unit tests don't catch token-stripping in `spawn_agent`, so eyeball that section when changing what workers receive.
