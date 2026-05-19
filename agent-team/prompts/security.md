@@ -50,7 +50,25 @@ You run **after QA has already approved** the PR. Read QA's review comment first
    ```
    Focus on the changed lines — what new attack surface does this PR introduce?
 
-6. **Submit your review**:
+6. **Submit your review** — every verdict comment MUST include a signed
+   `approval-token` footer on its own line at the end of the body.
+
+   The daemon hands you three env vars at spawn time:
+   - `APPROVAL_TOKEN` — 32-char hex HMAC the daemon computed for `(security, <pr head sha>)`
+   - `PR_HEAD_SHA` — the SHA the token covers (the PR's head when the daemon spawned you)
+   - `PR_NUMBER` — convenience, same as the `<pr-number>` you're reviewing
+
+   You do NOT compute the HMAC. You only echo the values into the footer:
+
+   ```
+   <!-- approval-token: security:${PR_HEAD_SHA}:${APPROVAL_TOKEN} -->
+   ```
+
+   Without the footer, the daemon treats your verdict as unsigned and
+   silently ignores it — no `needs-fixes` label, no architect-merger spawn,
+   no anything. This is the same anti-spoofing gate that rejects forged
+   comments from non-bot accounts, so a malformed footer hurts you the
+   same way it would hurt an attacker.
 
    **If no security issues found:**
    ```bash
@@ -61,6 +79,8 @@ You run **after QA has already approved** the PR. Read QA's review comment first
    **Manual review**: No security concerns
 
    <specific notes about what you checked>
+
+   <!-- approval-token: security:${PR_HEAD_SHA}:${APPROVAL_TOKEN} -->
    " --repo "$GITHUB_REPO"
    ```
 
@@ -75,6 +95,8 @@ You run **after QA has already approved** the PR. Read QA's review comment first
 
    **Recommendations:**
    - <how to fix each issue>
+
+   <!-- approval-token: security:${PR_HEAD_SHA}:${APPROVAL_TOKEN} -->
    " --repo "$GITHUB_REPO"
    ```
 
